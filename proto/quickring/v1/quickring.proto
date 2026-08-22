@@ -1,0 +1,635 @@
+// Quickring wire protocol — v1. CANONICAL SCHEMA.
+//
+// This file is the single source of truth for the Quickring wire standard.
+// Per ADR-0002 (quickring/fabric-kit/docs/adr/), Quickring is a self-contained
+// open standard; every implementation — Fabric Kit (the reference SDK),
+// DeviceNix message-kit (the on-device base-layer implementation), and any
+// third-party client — vendors a PINNED copy of this file and generates its own
+// bindings. No implementation owns the schema; they conform to it.
+//
+// Companion prose spec: ../../../docs/protocol.md (normative for semantics).
+//
+// Two layers live in one schema (ADR-0002):
+//   • Base layer  — the Envelope, tag correlation, the T/R/D grammar, RError,
+//                   and addressing. Implemented on-device by message-kit.
+//   • Fabric layer — sessions, pub/sub, pairing, presence, catch-up. Implemented
+//                    by the Quickring daemon / hub.
+// The split is one of ownership-of-behavior, not of file: the Envelope's oneof
+// enumerates every v1 message so a capture is self-describing.
+//
+// Conventions: timestamps are unix milliseconds UTC. Tag 0 is reserved for
+// D-messages. proto3.
+
+syntax = "proto3";
+
+package quickring.v1;
+
+// ===========================================================================
+// Envelope (base layer)
+// ===========================================================================
+
+// Every message on the wire is a single Envelope.
+message Envelope {
+  // Correlation tag. Echoed by the server in the matching R-message or RError.
+  // Set to 0 for D-messages. Every T-message in v1 carries a non-zero tag.
+  uint32 tag = 1;
+
+  // Exactly one of these is set per envelope.
+  oneof body {
+    // Session lifecycle
+    TVersion     t_version     = 10;
+    RVersion     r_version     = 11;
+    THello       t_hello       = 12;
+    RHello       r_hello       = 13;
+    TPing        t_ping        = 14;
+    RPing        r_ping        = 15;
+
+    // Topic operations
+    TSubscribe   t_subscribe   = 20;
+    RSubscribe   r_subscribe   = 21;
+    TUnsubscribe t_unsubscribe = 22;
+    RUnsubscribe r_unsubscribe = 23;
+    TPublish     t_publish     = 24;
+    RPublish     r_publish     = 25;
+
+    // Offline catch-up
+    TCatchUp     t_catchup     = 30;
+    RCatchUp     r_catchup     = 31;
+
+    // Device pairing
+    TPair        t_pair        = 40;
+    RPair        r_pair        = 41;
+
+    // Roster read — D3 (encryption.md §5.4). A device learns a peer's public
+    // keys by asking the hub for the peer's roster entry and verifying that
+    // entry against the household authority root it already holds. The hub is
+    // a DIRECTORY, never an AUTHORITY: it can withhold or stale an entry, but
+    // it cannot forge one. See the roster section below.
+    TRoster      t_roster      = 50;
+    RRoster      r_roster      = 51;
+
+    // Error response (replaces any R-message)
+    RError       r_error       = 99;
+
+    // Server-pushed deliveries (D-messages)
+    DDeliver        d_deliver          = 100;
+    DPresence       d_presence         = 101;
+    DPairClaim      d_pair_claim       = 102;
+    // 103 intentionally skipped — reserved neighbourhood for a future DPair* push.
+    DPairResult     d_pair_result      = 104;
+    DSessionRevoked d_session_revoked  = 105; // capability-model freeze F3 / roadmap §5 rung 2
+  }
+
+  // --- Reserved envelope field numbers (D3 / encryption.md §5.4).
+  //
+  // 52–59: held for the roster family. Do not allocate them to anything else.
+  //
+  // 106: held for a future DRosterChanged push, which is deliberately NOT
+  // defined in v1 (encryption.md §5.4.6 item 6). The push would buy freshness
+  // that a hostile hub cannot be forced to provide, and against a cooperative
+  // hub the fetch-before-wrap rule (§5.4.4) already covers every case that
+  // matters. Reserving the number keeps the addition additive and unhurried if
+  // publish-cadence data ever justifies it.
+  //
+  // These are real `reserved` statements rather than a skip-comment (cf. 103
+  // above) so that protoc enforces them instead of relying on a reader
+  // noticing the comment. Un-reserving is then a deliberate act, which is the
+  // point.
+  reserved 52 to 59, 106;
+}
+
+// ===========================================================================
+// Shared types
+// ===========================================================================
+
+message ClientInfo {
+  string platform = 1;    // "macos", "ios", "android", "web", "linux-headless", "thunderhead"
+  string sdk_name = 2;    // "quickring-dart", "quickring-rust", "quickring-js", or third-party id
+  string sdk_version = 3; // semver
+  string app_name = 4;    // optional; for third-party integrations
+}
+
+enum PresenceState {
+  PRESENCE_UNKNOWN = 0;
+  PRESENCE_OFFLINE = 1;
+  PRESENCE_ONLINE = 2;
+  PRESENCE_AWAY = 3;
+}
+
+message DevicePresence {
+  string device_id = 1;
+  PresenceState state = 2;
+  int64 last_seen_ms = 3;
+  ClientInfo client_info = 4;
+}
+
+// ===========================================================================
+// Session lifecycle (fabric layer)
+// ===========================================================================
+
+message TVersion {
+  string version = 1;           // highest version the client supports; v1 = "quickring.v1"
+  uint32 max_envelope_size = 2; // informational; hard ceiling is 1 MiB regardless
+}
+
+message RVersion {
+  string version = 1;           // highest version both support
+  uint32 max_envelope_size = 2; // actual ceiling: min(client offer, server limit)
+
+  // Server-issued random nonce for device proof-of-possession at THello
+  // (additive). Delivered before THello so a paired client can sign
+  // (hello_challenge ‖ account_id ‖ device_id) with its device key and set
+  // THello.device_key_signature. Empty for servers that do not challenge;
+  // clients that hold no device key ignore it. No new round trip — RVersion
+  // already precedes THello.
+  bytes hello_challenge = 3;
+
+  // Hub build/version string (additive) — diagnostic only. Purely
+  // informational: it MUST NOT drive any protocol behavior. Only `version`
+  // (field 1) governs interoperability and negotiation; a client MAY display
+  // server_version but MUST NOT branch on it, gate on it, or make any trust
+  // decision from it — it is unauthenticated (not covered by any signed
+  // data). Empty from a hub that does not set it; a client renders that as
+  // "unknown", never as malformed. Treat it as an opaque display string;
+  // RECOMMENDED form is "<semver>+<shortsha>" (e.g. CARGO_PKG_VERSION plus an
+  // optional GIT_SHA) and it SHOULD stay short (<= 64 bytes).
+  string server_version = 4;
+}
+
+message THello {
+  // Account-authentication credential. A oneof from day one so new methods are
+  // additive. v1 implements ONLY bearer_token; the reserved arms are rejected
+  // with RError(AUTH_INVALID) if sent.
+  oneof auth {
+    string bearer_token = 1; // token from the HTTP auth flow at api.quickring.me
+    // Reserved for v2+ (not implemented in v1):
+    //   bytes client_cert = 5;
+  }
+
+  string device_id = 2;           // stable device UUID, persisted on the agent
+  optional bytes resume_token = 3; // from a prior session; restores subscriptions, not messages
+  ClientInfo client_info = 4;     // diagnostics only; never an auth input
+
+  // Device proof-of-possession binding (additive; field 6 is the slot the
+  // oneof historically reserved for device-key auth). NOT a oneof arm: it is
+  // orthogonal to `auth` and coexists with bearer_token. When present, it is an
+  // Ed25519 signature over (hello_challenge ‖ account_id ‖ device_id) using the
+  // device's registered key. The `auth` credential still resolves the account
+  // exactly as today; if this signature is present the server ADDITIONALLY
+  // verifies it against the registered key for (account, device_id) and rejects
+  // with RError(AUTH_INVALID) on mismatch — binding device_id to a key the
+  // holder can prove, without replacing token auth. Absent → unchanged
+  // bearer-only behavior (a device with no registered key is not rejected).
+  // A standalone field (not a oneof arm) precisely so it can bind alongside a
+  // token now, and later stand alone (tokenless PoP: auth unset + signature
+  // present, once the server can resolve an account from the key) without a
+  // wire break.
+  bytes device_key_signature = 6;
+}
+
+message RHello {
+  string session_id = 1;                    // log correlation; not security-sensitive
+  string account_id = 2;                    // account this device belongs to
+  bytes resume_token = 3;                   // present in next THello to resume; rotated each session
+  repeated DevicePresence presence_digest = 4; // other devices + presence, for immediate UI
+  int64 server_time_ms = 5;                 // server time at RHello, for clock alignment
+}
+
+message TPing {
+  int64 client_time_ms = 1; // optional, for round-trip latency
+}
+
+message RPing {
+  int64 server_time_ms = 1;
+  int64 client_time_ms = 2; // echoed from request, if provided
+}
+
+// ===========================================================================
+// Topic operations (fabric layer)
+// ===========================================================================
+
+message TSubscribe {
+  string topic = 1;
+  // QR-134: a subscription is ALWAYS forward-only. Catch-up across a gap is
+  // TCatchUp's job and TCatchUp's alone — one catch-up path, not two.
+  reserved 2;
+  reserved "since_ms";
+}
+
+message RSubscribe {
+  string subscription_id = 1; // server-issued handle, echoed in DDeliver
+  string topic = 2;           // resolved/canonicalised topic
+  int64 server_time_ms = 3;   // anchor for a future TCatchUp's since_ms
+}
+
+message TUnsubscribe {
+  string subscription_id = 1;
+}
+
+message RUnsubscribe {
+  // Empty on success.
+}
+
+message TPublish {
+  string topic = 1;
+  bytes payload = 2;                    // opaque to the hub; ciphertext on E2E topics
+  optional string client_message_id = 3; // dedup key; (account_id, id) held 10 min in Redis
+  optional string payload_type = 4;      // app-layer hint, never interpreted by the hub
+}
+
+message RPublish {
+  string message_id = 1;    // hub-assigned ULID (globally unique, time-ordered)
+  int64 server_time_ms = 2; // explicit sort key; ULID is the millisecond tiebreaker
+}
+
+// ===========================================================================
+// Server-pushed messages (fabric layer) — tag is always 0
+// ===========================================================================
+
+message DDeliver {
+  string subscription_id = 1;
+  string topic = 2;
+  string message_id = 3;
+  string sender_device_id = 4;
+  string sender_account_id = 5;
+  int64 server_time_ms = 6;
+  bytes payload = 7;
+  optional string payload_type = 8;
+}
+
+message DPresence {
+  string device_id = 1;
+  string account_id = 2;
+  PresenceState state = 3;
+  int64 last_seen_ms = 4;
+  optional ClientInfo client_info = 5; // populated only on transition to ONLINE
+}
+
+// Pushed to the device whose session was administratively invalidated —
+// its registration was replaced (e.g. a device-0 key rotation) or an
+// account owner revoked it. Sent immediately BEFORE the server closes the
+// connection, so a client that receives it can distinguish a deliberate
+// revocation from a transient network drop. A connection that misses this
+// push (e.g. offline at the moment of revocation) is still bounded — every
+// `TPing` re-validates the connection's registration against current
+// state and closes with no reply if it no longer checks out (see
+// "Heartbeats" above). `reason` is an enum, never free text: nothing about
+// *why* beyond the enum value belongs on this push.
+message DSessionRevoked {
+  string device_id = 1;
+  string account_id = 2;
+  SessionRevokeReason reason = 3;
+  int64 revoked_at_ms = 4;
+}
+
+enum SessionRevokeReason {
+  SESSION_REVOKE_REASON_UNKNOWN = 0;
+  REVOKED_BY_OWNER = 1; // an account owner explicitly revoked this device
+  DEVICE_REMOVED = 2;   // the device's registration was replaced or removed
+  SESSION_EXPIRED = 3;  // reserved; no active producer in v1
+}
+
+// ===========================================================================
+// Offline catch-up (fabric layer)
+// ===========================================================================
+
+message TCatchUp {
+  string subscription_id = 1; // implies topic + authorization
+  int64 since_ms = 2;         // messages with server_time_ms > since_ms
+  uint32 limit = 3;           // max in this batch; server may return fewer
+}
+
+message RCatchUp {
+  repeated DDeliver deliveries = 1; // same shape as live deliveries
+  bool has_more = 2;
+  int64 server_time_ms = 3; // use as the next since_ms to avoid races
+}
+
+// ===========================================================================
+// Device pairing (fabric layer)
+// ===========================================================================
+
+enum PairStep {
+  PAIR_STEP_UNKNOWN = 0;
+  PAIR_STEP_INITIATE = 1; // existing device: start a pairing
+  PAIR_STEP_CLAIM = 2;    // new device: claim the pair session via the QR payload
+  PAIR_STEP_APPROVE = 3;  // existing device: approve the claim
+}
+
+message TPair {
+  PairStep step = 1;
+  oneof step_body {
+    TPairInitiate initiate = 2;
+    TPairClaim claim = 3;
+    TPairApprove approve = 4;
+  }
+}
+
+message TPairInitiate {
+  string label = 1; // optional, for logs
+}
+
+message TPairClaim {
+  string pair_session_id = 1;   // from the QR code
+  bytes new_device_pubkey = 2;  // Ed25519 identity key, 32 bytes
+  ClientInfo client_info = 3;
+  string proposed_device_name = 4;
+
+  // --- F7 (encryption.md §5.3). Additive; all three are set together or
+  // none of them are. A claim that sets some but not all is rejected.
+  bytes new_device_sealing_pubkey = 5;      // X25519, 32 bytes (RFC 7748)
+  bytes new_device_sealing_binding_sig = 6; // Ed25519 over §3.2 material, 64 bytes
+  int64 sealing_created_at_ms = 7;          // covered by the binding signature
+}
+
+message TPairApprove {
+  string pair_session_id = 1;
+  // Ed25519 over the attestation material. v1 = the bare 32-byte
+  // new_device_pubkey; v2 = the domain-separated material in
+  // encryption.md §5.3. Which one the hub verifies is determined by the
+  // pair session, never by this message — see protocol.md.
+  bytes signature = 2;
+  // F7. The approver's own `signed_at_ms`, which is INSIDE the v2 signed
+  // material and therefore cannot be chosen by the hub. Ignored for v1.
+  int64 signed_at_ms = 3;
+}
+
+message RPair {
+  PairStep step = 1;
+  oneof step_body {
+    RPairInitiated initiated = 2; // → existing device (response to INITIATE)
+    RPairClaimed claimed = 3;     // → new device (response to CLAIM)
+    RPairComplete complete = 4;   // → existing device (response to APPROVE)
+  }
+}
+
+message RPairInitiated {
+  string pair_session_id = 1; // encoded into the QR; short-lived (60s)
+  string qr_payload = 2;      // quickring://pair?... (session id + bootstrap endpoint + credential)
+  int64 expires_at_ms = 3;
+}
+
+message RPairClaimed {
+  // Terminal response to TPair(CLAIM); does NOT carry credentials. Approval
+  // arrives later as DPairResult. Keeps "one T, one R" intact.
+  string pair_session_id = 1;
+  int64 expires_at_ms = 2;
+}
+
+message RPairComplete {
+  string new_device_id = 1;
+  string new_device_name = 2;
+}
+
+message DPairClaim {
+  // → existing device(s): a new device claimed a pair session. Tag 0.
+  string pair_session_id = 1;
+  bytes new_device_pubkey = 2;
+  string proposed_device_name = 3;
+  ClientInfo new_device_client_info = 4;
+
+  // --- F7 (encryption.md §5.3). Relayed verbatim from TPairClaim; the hub
+  // neither mints nor rewrites them. Empty when the claiming device
+  // predates F7, which is a v1 pairing (see protocol.md).
+  bytes new_device_sealing_pubkey = 5;
+  bytes new_device_sealing_binding_sig = 6;
+  int64 sealing_created_at_ms = 7;
+
+  // F7. The device id the hub has reserved for this claim, minted at CLAIM
+  // rather than at APPROVE because it is INSIDE the v2 attestation material
+  // the approver signs. Empty on a v1 pairing.
+  string new_device_id = 8;
+}
+
+message DPairResult {
+  // → new device: final outcome of a claimed pairing. Tag 0.
+  string pair_session_id = 1;
+  PairOutcome outcome = 2;
+  optional PairCredentials credentials = 3; // only when outcome == OUTCOME_APPROVED
+}
+
+enum PairOutcome {
+  OUTCOME_UNKNOWN = 0;
+  OUTCOME_APPROVED = 1;
+  OUTCOME_REJECTED = 2;
+  OUTCOME_TIMEOUT = 3;
+}
+
+message PairCredentials {
+  string device_id = 1;
+  string account_id = 2;
+  string bearer_token = 3; // for the new device's first THello
+  bytes resume_token = 4;
+}
+
+// ===========================================================================
+// Roster read (fabric layer) — D3, encryption.md §5.4
+// ===========================================================================
+//
+// The wire path that delivers one device's public keys to another. The hub
+// serves an UNTRUSTED DIRECTORY OF SELF-AUTHENTICATING RECORDS: it returns
+// each device's identity key, sealing key, sealing binding signature and
+// pairing attestation exactly as they were signed, and every one of those is
+// verified client-side against the household authority root. The hub can
+// withhold an entry but can never forge one.
+//
+// A roster of devices on an account exists only because there is a network
+// fabric, so this is Hearth-fabric, not messagekit-base. Nothing in the base
+// layer changes. DevicePresence and RHello are deliberately UNTOUCHED — see
+// encryption.md §5.4.6 items 1 and 2 for why folding the roster into either
+// was rejected.
+//
+// The normative reader-side verification order is encryption.md §5.4.5, and
+// the fetch-before-wrap and truncation-is-not-absence rules are §5.4.4. Both
+// are reproduced in docs/protocol.md; neither is restated in full here.
+
+message TRoster {
+  // Device ids to fetch. EMPTY MEANS THE WHOLE ROSTER for this connection's
+  // account.
+  //
+  // There is deliberately no account_id field. The account is the session's,
+  // established at THello and proved at RVersion's hello_challenge; accepting
+  // one here would be an authorization decision taken from client-supplied
+  // data, which is the shape of every cross-tenant read bug ever written.
+  //
+  // A client fetching in order to wrap SHOULD send this empty (the whole-roster
+  // form) rather than naming a single device id, so the request does not
+  // disclose the wrap target to the hub (§5.4.4).
+  repeated string device_ids = 1;
+}
+
+message RRoster {
+  // One entry per device the hub could answer for. A requested device id with
+  // no entry is ABSENT, not an error. Partial answers are normal and MUST NOT
+  // fail the request.
+  repeated RosterEntry entries = 1;
+
+  // The household authority root every attestation chain in this reply must
+  // terminate at, and — where the household has been through the device-0
+  // handoff (encryption.md §4.3) — the transition attestation that authorizes
+  // it. Both are carried in the same reply, deliberately: a chain that cannot
+  // be terminated cannot be verified, and a verifier that needs a second round
+  // trip to finish checking one answer is a verifier that eventually ships with
+  // the second call skipped.
+  //
+  // A root that arrives with no chain to a root the reader already holds MUST
+  // deny. A new root is never accepted on the hub's word (§5.4.5 step 1).
+  bytes household_authority_root_pubkey = 2;
+  optional TransitionAttestation authority_transition = 3;
+
+  // True only when the WHOLE-ROSTER form was cut short. Never true for a
+  // request that named device_ids explicitly.
+  //
+  // NORMATIVE: truncated = true MUST NOT be used to conclude anything about a
+  // device that is NOT present in the reply (§5.4.4). "I asked for the roster,
+  // that device wasn't in it, therefore it isn't paired" is exactly the
+  // reasoning a truncated reply invalidates.
+  //
+  // The hub SHOULD cap the whole-roster form so this message stays inside the
+  // connection's negotiated max_envelope_size; 256 entries is the recommended
+  // cap and is where truncation comes from.
+  bool truncated = 4;
+
+  // Server time, unix ms. Same field, same reason, as RHello.server_time_ms.
+  int64 server_time_ms = 5;
+}
+
+message RosterEntry {
+  string device_id = 1;
+
+  // Ed25519 identity key (encryption.md §3.1). Always present.
+  bytes ed25519_pubkey = 2;
+
+  // X25519 sealing key and its §3.2 binding. Present only once the device has
+  // minted one. ALL THREE ARE PRESENT OR ALL THREE ARE ABSENT: a sealing key
+  // without its binding signature, and without the timestamp that is inside
+  // that signature, is unverifiable — and an unverifiable field is worse than a
+  // missing one, because something will eventually use it.
+  //
+  // sealing_binding_sig is Ed25519 over the §3.2 material
+  //   "qr-sealing-binding-v1" ‖ 0x00 ‖ len16(device_id) ‖ device_id
+  //   ‖ x25519_pubkey ‖ be64(sealing_created_at_ms)
+  // and verifies under THIS ENTRY'S OWN ed25519_pubkey.
+  bytes x25519_pubkey         = 3;
+  bytes sealing_binding_sig   = 4;
+  int64 sealing_created_at_ms = 5;
+
+  // The F6/F7 pairing attestation, verbatim as the approver signed it. Absent
+  // for pre-F6 devices and for the household's first device, which is attested
+  // by the authority root itself rather than by a peer. A device with no
+  // attestation is unverifiable and therefore not wrappable (§5.4.4).
+  optional PairingAttestation attestation = 6;
+}
+
+message PairingAttestation {
+  // 1 or 2 (protocol.md, "The pairing attestation — v1 and v2"). A stored
+  // record with no version is v1 by definition. An UNKNOWN version DENIES — it
+  // is never trial-verified against each known material in turn.
+  //
+  // Deliberately a uint32 and NOT a proto enum: an unknown enum value decodes
+  // to 0 in most bindings and the actual value is lost, which is precisely the
+  // value a deny needs to log. The rule here is "deny on unknown", not "map
+  // unknown onto a default", so the wire type that preserves the received
+  // number is the correct one.
+  uint32 version            = 1;
+  string approver_device_id = 2;
+  // The approver's key AS IT STOOD AT SIGNING TIME — snapshotted, not looked up
+  // live, so a later rotation on the approver's device cannot retroactively
+  // reinterpret history.
+  bytes  approver_pubkey    = 3;
+  bytes  signature          = 4;
+  int64  signed_at_ms       = 5;
+
+  // NOTE — this message deliberately does NOT carry its own copy of
+  // new_device_pubkey / new_device_x25519_pubkey. The verifier reconstructs the
+  // v2 signed material from the ENTRY'S OWN device_id, ed25519_pubkey and
+  // x25519_pubkey (encryption.md §5.4.2).
+  //
+  // This is the load-bearing property of the whole design: a hub that
+  // substitutes a key into a RosterEntry necessarily breaks the signature it is
+  // serving in the same message, so no consistent lie is available to it. If
+  // the attestation carried its own copy of the keys, a hub could serve a
+  // matched (attested-key, substituted-key) pair and leave the verifier to
+  // notice a discrepancy it may not have been written to check.
+  // DO NOT ADD THOSE FIELDS BACK FOR "COMPLETENESS."
+}
+
+message TransitionAttestation {
+  // The device-0 handoff attestation (encryption.md §4.3), binding the OLD
+  // household authority root to the NEW one.
+  //
+  // Informational only — approver_device_id is NOT covered by the signature
+  // below. §4.3's signed material is
+  //   "qr-authority-transition-v1" ‖ 0x00 ‖ len16(account_id) ‖ account_id
+  //   ‖ old_root_pubkey ‖ new_root_pubkey ‖ be64(signed_at_ms)
+  // which contains no device id. Treat this field as a diagnostic label and
+  // never as an authenticated assertion.
+  string approver_device_id              = 1;  // "device-0" today
+  bytes  approver_pubkey                 = 2;  // the OLD root, at signing
+  bytes  household_authority_root_pubkey = 3;  // the NEW root
+  bytes  signature                       = 4;
+  int64  signed_at_ms                    = 5;
+
+  // NOTE — there is deliberately no account_id field, even though §4.3's signed
+  // material covers one. The verifier MUST reconstruct it from the SESSION
+  // (RHello.account_id), never from this reply. Carrying it here would let the
+  // hub choose the domain the signature is checked in, which is the same
+  // client-supplied-authorization-input mistake TRoster avoids by having no
+  // account_id either. Same rule, both directions.
+}
+
+// ===========================================================================
+// Errors (base layer)
+// ===========================================================================
+
+message RError {
+  ErrorCode code = 1;
+  string message = 2; // human-readable; not for programmatic branching
+  bytes details = 3;  // optional structured detail; schema varies by code
+}
+
+enum ErrorCode {
+  ERROR_UNKNOWN = 0;
+
+  // Session lifecycle
+  VERSION_INCOMPATIBLE = 1;
+  AUTH_INVALID = 2;
+  AUTH_EXPIRED = 3;
+  HELLO_REQUIRED = 4;  // T-message sent before THello
+  ALREADY_HELLOED = 5; // second THello on the same connection
+
+  // Protocol
+  TAG_IN_USE = 10;
+  MALFORMED_ENVELOPE = 11;
+  UNKNOWN_MESSAGE_TYPE = 12;
+  ENVELOPE_TOO_LARGE = 13;
+
+  // Topics
+  TOPIC_INVALID = 20;
+  TOPIC_UNAUTHORIZED = 21;
+  SUBSCRIPTION_NOT_FOUND = 22;
+  PUBLISH_RATE_LIMITED = 23;
+  SUBSCRIBE_RATE_LIMITED = 24;
+
+  // Catch-up
+  CATCHUP_HORIZON_EXCEEDED = 30;
+
+  // Pairing
+  PAIR_SESSION_NOT_FOUND = 40;
+  PAIR_SESSION_EXPIRED = 41;
+  PAIR_SIGNATURE_INVALID = 42;
+
+  // Roster (D3). 51–59 reserved for this family — see the `reserved` below.
+  // There is no ROSTER_DEVICE_NOT_FOUND: a requested device id with no entry
+  // is ABSENT from RRoster.entries, not an error, and a partial answer never
+  // fails the request.
+  ROSTER_RATE_LIMITED = 50;
+
+  // Generic
+  INTERNAL = 90;                // hub-side bug; report to ops
+  TEMPORARILY_UNAVAILABLE = 91; // backoff and retry
+  ABUSE_DETECTED = 92;          // suspicious pattern; connection closing
+
+  // 51–59 held for the roster family (D3 / encryption.md §5.4.1).
+  reserved 51 to 59;
+}
