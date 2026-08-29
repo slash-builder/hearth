@@ -1,13 +1,41 @@
-# Quickring Encryption — key management and content confidentiality
+# Hearth Encryption — key management and content confidentiality
 
-**Status:** **SPECIFIED. NOTHING IN THIS DOCUMENT IS IMPLEMENTED.** As of
-2026-08-16 the only cryptographic primitive anywhere in the Quickring stack is
-Ed25519 signing (`ed25519-dalek`, in `fabric-kit`, `gateway`, and `hub`). There
-is no X25519 key, no AEAD, no HPKE, and no ciphertext on the wire. The hub reads
-every payload in plaintext and retains it for seven days.
+**Status:** **SPECIFIED; E0 and E1 ARE IMPLEMENTED AND LIVE.** The QR-136
+encryption programme executed and was countersigned on 2026-08-20: X25519
+device sealing keys, RFC 9180 HPKE (`DHKEM(X25519, HKDF-SHA256)` /
+HKDF-SHA256 / ChaCha20-Poly1305) key wrapping, and XChaCha20-Poly1305 content
+encryption are all real, shipping code in `fabric-kit`, with E0 seal → unwrap
+and E1 `publish_encrypted` → hub relay → `decrypt_if_sealed` both live-verified
+end to end between independent connections. Real device pairing and real chat
+encryption ship in Courier (v0.1.33+). Ciphertext is on the wire.
 
-**Audience:** Quickring implementers, SDK developers, third-party implementors
-of the Hearth protocol.
+Two honest qualifications:
+
+- **Implemented is not the same as conformant.** `fabric-kit`'s current E0 path
+  is live but not yet fully conformant to this document's byte-level spec; that
+  gap is being closed under **QR-228 / QR-229**. Where this document and the
+  current code disagree, **this document is normative** and the code is the
+  thing that moves.
+- **E2 and beyond are still design only.** Everything below the cut line
+  (per-resource keys, rekey-on-revoke, key epochs, forward secrecy) is
+  specified and unbuilt. §1.2's table is the per-section source of truth.
+
+> **Doc-lag note (CLUS-54, 2026-08-29).** Until this edit, this header read
+> "**SPECIFIED. NOTHING IN THIS DOCUMENT IS IMPLEMENTED**" and described the
+> pre-implementation state as of 2026-08-16 — no X25519 key, no AEAD, no HPKE,
+> no ciphertext on the wire. That was overtaken by QR-136 four days later and
+> was carried forward unchanged through the 2026-08-22 extraction of this spec
+> from `quickring/quickring.me` into `slash-builder/hearth` (which flagged it
+> in the repo README as known, unfixed staleness). It was a documentation lag,
+> never a statement about the code. The old header's last sentence — "the hub
+> reads every payload in plaintext" — is the part that has most concretely
+> changed: an E1-encrypted publish reaches the hub as ciphertext and the hub
+> routes it on metadata alone. Payloads sent on paths that do not yet encrypt
+> still transit in plaintext; §1.2 says which is which, and §11 is the honest
+> account of the remaining gap.
+
+**Audience:** Hearth implementers, SDK developers, third-party implementors of
+the protocol.
 
 **Scope:** This document is normative for key management, content
 confidentiality, and the sealed-payload primitive. It is the sibling document
@@ -45,26 +73,33 @@ model](#8-capability-tokens-and-encryption--the-seam) and `protocol.md`).
 ### 1.2 Implementation status
 
 Copying `protocol.md`'s discipline: **nothing here may read as shipped before it
-ships.** This table is the single place to check.
+ships** — and, equally, nothing that *has* shipped may keep reading as unbuilt.
+This table is the single place to check.
+
+**Last reconciled: 2026-08-29 (CLUS-54), against the QR-136 countersign of
+2026-08-20.** The rows below were written on 2026-08-16 and went stale four days
+later; the E0/E1 rows are corrected here. A row that says IMPLEMENTED means the
+behavior is live, **not** that it is byte-conformant to this document — see the
+conformance column note and QR-228/229.
 
 | § | Subject | Programme | Status |
 |---|---|---|---|
 | 2 | Threat model | — | **SPECIFIED** |
 | 3.1 | Device identity key (Ed25519) | pre-E0 | **IMPLEMENTED** (`gateway/identity.rs`, `fabric-kit/pairing.rs`) |
-| 3.2 | Device sealing key (X25519) | E0 | **SPECIFIED.** Hub-side storage reserved and unused (`hub/pairing.rs::set_device_sealing_key` — "nothing calls this yet"). No client or gateway mints one. |
-| 3.3–3.5 | Content keys, `key_id`, never-derive rule | E1 | **SPECIFIED. NOT IMPLEMENTED.** No content key exists in any household. |
+| 3.2 | Device sealing key (X25519) | E0 | **IMPLEMENTED.** Minted and used by `fabric-kit` (`sealing.rs`); bound to the device by the F7 attestation (§5.3) and returned in v2 roster entries with a usable sealing key (QR-137, live-verified 2026-08-20). The 2026-08-16 note that "no client or gateway mints one" is obsolete. |
+| 3.3–3.5 | Content keys, `key_id`, never-derive rule | E1 | **IMPLEMENTED.** `fabric-kit/content_key.rs`; a household content key exists and is wrapped per device. The never-derive rule (§3.3) is a MUST and is honored — identity and sealing keys are independent. |
 | 3.6 | Key epochs | E3 | **SPECIFIED, DEFERRED.** Field reserved, always `0` at E1. |
 | 4 | Root of authority vs. root of custody | E1 | **SPECIFIED.** Bootstrap rework in progress; current code (`api/src/device0.rs`) implements the superseded model. |
 | 5.2 | Pairing attestation (F6) | E0 | **IMPLEMENTED.** Persisted by `hub/pairing.rs` (commit `8c63496`, extended by F7 below). |
-| 5.3 | F7 — attestation covers the sealing key | E0 | **IMPLEMENTED.** `TPairClaim`/`DPairClaim`/`TPairApprove` fields are in `protocol.md`. Hub-side v2 material and version discrimination are on `hub` `main` (PR #13, merged 2026-08-17). |
-| 5.4 | Roster read (D3) | E0 | **SPECIFIED, IMPLEMENTABLE NOW.** `TRoster`/`RRoster`, envelope 50/51 — ruled by messaging-architect 2026-08-17. The two record-side gaps this section originally named are already resolved on `hub` `main` (§5.4.7) — not yet implemented, but not blocked. |
-| 5.6 | Content-key delegation exchange | E1 | **SPECIFIED. NOT IMPLEMENTED.** |
-| 6 | Payload encryption | E1 | **SPECIFIED. NOT IMPLEMENTED.** Every payload on the fabric is plaintext today. |
-| 7 | Sealed payloads | E0 | **SPECIFIED. NOT IMPLEMENTED.** |
+| 5.3 | F7 — attestation covers the sealing key | E0 | **IMPLEMENTED.** `TPairClaim`/`DPairClaim`/`TPairApprove` fields are in `protocol.md`. Hub-side v2 material and version discrimination are on `hub` `main` (PR #13, merged 2026-08-17); client-side wiring live-verified with real device-0-approved pairing (`fabric-kit` `97b522d`). |
+| 5.4 | Roster read (D3) | E0 | **IMPLEMENTED.** `TRoster`/`RRoster`, envelope 50/51 — ruled by messaging-architect 2026-08-17; the 7-step `fetch_roster` verify path is live and returns v2 entries with usable sealing keys (QR-137, `fabric-kit` PRs #10/#12, `72af798`). |
+| 5.6 | Content-key delegation exchange | E1 | **IMPLEMENTED, device→device.** The hub-mediated `/keys/*` variant was deleted by ruling (`hub` PR #19, −2607 LOC); the device→device exchange described here is the normative and the shipped one. |
+| 6 | Payload encryption | E1 | **IMPLEMENTED.** XChaCha20-Poly1305 under the household content key; `publish_encrypted` → hub relay → `decrypt_if_sealed` live-verified between two independent connections (`fabric-kit` PRs #13/#14, `0d0a287`/`8b0b58e`) and shipping as real chat encryption in Courier v0.1.33+. Payloads published on paths that do not yet call the encrypting API still transit in plaintext — see §11. |
+| 7 | Sealed payloads | E0 | **IMPLEMENTED, conformance gap open.** Real RFC 9180 HPKE `mode_base`, DHKEM(X25519, HKDF-SHA256) / HKDF-SHA256 / ChaCha20-Poly1305 (`fabric-kit/seal.rs`, `sealing.rs`); `seal_to_devices` → paired-device unwrap recovers the key byte-identically (`72af798`). **`fabric-kit`'s current E0 path is not yet fully conformant to §7's byte layout; the gap is being closed under QR-228 / QR-229. This document is normative — the code moves, not the spec.** |
 | 8 | Capability seam | — | **SPECIFIED.** Capability core not implemented. |
 | 9 | Revocation and rekey | E3 | **SPECIFIED, DEFERRED to 2028.** |
 | 10 | Self-host decoupling | — | **SPECIFIED and verified against this design.** |
-| 11 | Rollout and migration | E1 | **SPECIFIED.** One open product call (§11.5). |
+| 11 | Rollout and migration | E1 | **PARTIALLY EXECUTED.** E0/E1 rolled out; §11's migration narrative predates that and still describes the rollout prospectively. One open product call (§11.5). |
 
 **The programme labels** (E0–E4) are the confidentiality decomposition:
 
@@ -160,6 +195,21 @@ attestation this design does not have.
 | "We cannot access your household." | **Only after authority-root rotation at handoff** (§4.3). Without rotation this sentence is false — the operator can read container memory while the bootstrap container lives. |
 | "It is cryptographically impossible for us to read your data." | **Never, under this design.** It would require hardware attestation (SEV-SNP / TDX / Nitro Enclaves) or a bootstrap that does not run on operator infrastructure. Neither exists here. |
 | Any present-tense claim of end-to-end encryption | **Not until E1 ships.** Any such sentence live today is false. |
+
+**Gate status, 2026-08-29 (CLUS-54).** The two E1-gated rows above have had
+their gate **met** — E1 shipped on 2026-08-20 (QR-136). They are left as
+written because the gate, not the verdict, is the durable part. What that
+means concretely:
+
+- The E1 rows are now defensible **only for content actually published
+  through the encrypting path**, and only for content published after the
+  household's content key existed (§11.2). A blanket "Hearth is end-to-end
+  encrypted" remains ahead of the code while §12's coverage gap is open.
+- The bootstrap-gated rows (§4.3) are **still gated**. `device0_seed_hex` has
+  not been deleted. Nothing about E1 shipping moves those.
+- Whether a met gate is actually *published* is a product call
+  (quickring-pm), not this document's. This section says what may be said,
+  never what should be.
 
 ---
 
@@ -1776,38 +1826,78 @@ ceremony. Do not build it now.
 ## 12. What is NOT implemented
 
 Deliberately duplicating §1.2's status table in prose, because a reader who
-skips the table must still not come away believing any of this is live.
+skips the table must still not come away believing more is live than is.
 
-**As of 2026-08-16:**
+**Corrected 2026-08-29 (CLUS-54).** This section was written on 2026-08-16 and
+listed E0 and E1 as entirely absent. QR-136 shipped them on 2026-08-20
+(countersigned) and this section was not updated, so for nine days it asserted
+the opposite of the truth. The obsolete list is preserved below the line as a
+historical record; **the live list is this one.**
 
-- **No content encryption exists.** Every payload on the fabric is plaintext.
-  The hub reads all of it and retains it for seven days.
-- **No X25519 key exists anywhere in the stack.** `hub/pairing.rs` has reserved
-  storage (`set_device_sealing_key` / `device_sealing_key`) and nothing calls
-  it. No client and no gateway mints a sealing keypair.
-- **No HPKE, no AEAD, no KDF.** `ed25519-dalek` is the only cryptographic
-  dependency in `fabric-kit`.
-- **No attestation chain is verified.** F6 attestations are persisted (commit
-  `8c63496`) and read back; nothing checks a chain of them, and F7 (§5.3) is not
-  filed against the wire yet.
-- **No roster-read wire path is implemented.** The shape is now ruled (§5.4:
-  `TRoster`/`RRoster`, envelope 50/51), but nothing implements it, and today a
-  device still cannot learn a peer's public key at all. Two record-side gaps
-  block implementation (§5.4.7): the persisted attestation on `hub` `main` has
-  no version field, and the reserved sealing-key storage cannot hold a
-  verifiable key.
-- **The bootstrap still implements the superseded model.** `api/src/device0.rs`
-  generates the household keypair server-side and persists the private seed as
-  `device0_seed_hex` in DynamoDB. There is no handoff, no rotation, no TTL, and
-  no death path.
-- **No capability enforcement.** Grants are household-wide prefix strings from
-  an environment variable.
-- **No revocation of anything.**
+**As of 2026-08-29 — still not implemented:**
 
-**What may be said publicly, and when,** is §2.4. Until E1 ships, no
-present-tense end-to-end-encryption claim may appear on any customer-facing
-surface. Any such sentence live today is false and its correction does not wait
-for this programme — it is an editing task, not an engineering one.
+- **E2 and everything below the cut line.** Per-resource keys (§3.4), key
+  epochs (§3.6), rekey-on-revoke (§9), forward secrecy / key transparency /
+  E2E account recovery (E4). Specified or deferred, none built.
+- **No key revocation.** §9 is deferred to 2028. Session revocation
+  (`DSessionRevoked`) exists on the wire and is a different thing: it ends a
+  session, it does not rotate or invalidate a key.
+- **No capability enforcement.** §8's seam is specified; the capability core is
+  not implemented, and grants are still household-wide prefix strings from an
+  environment variable.
+- **The bootstrap model.** `api/src/device0.rs` implements the superseded
+  server-side-keygen model (household keypair generated server-side, private
+  seed persisted as `device0_seed_hex`). §4's root-of-authority /
+  root-of-custody split is the target, not the current state. *(Carried
+  forward from the 2026-08-16 text and not re-verified in this doc pass —
+  check `api` before relying on it either way.)*
+- **Not everything on the fabric is encrypted.** E1 is available and shipping,
+  but payloads published on paths that do not call the encrypting API still
+  transit and are retained in plaintext. §11 is the honest account of that gap;
+  "E1 exists" is not "E1 is universal."
+- **E0 is not yet byte-conformant.** `fabric-kit`'s E0 path works end to end but
+  does not yet match §7's byte layout exactly; QR-228 / QR-229 close it. This
+  document is normative.
+
+**What may be said publicly, and when,** is §2.4. E1 having shipped narrows but
+does not erase that discipline: a present-tense end-to-end-encryption claim is
+now defensible **only** for the specific paths that actually encrypt, and a
+blanket "Hearth is end-to-end encrypted" is still ahead of the code while the
+previous bullet is open. Check §2.4 before writing marketing copy.
+
+---
+
+<details>
+<summary><strong>Superseded — the 2026-08-16 text, kept as a record</strong></summary>
+
+> **As of 2026-08-16:**
+>
+> - **No content encryption exists.** Every payload on the fabric is plaintext.
+>   The hub reads all of it and retains it for seven days.
+> - **No X25519 key exists anywhere in the stack.** `hub/pairing.rs` has reserved
+>   storage (`set_device_sealing_key` / `device_sealing_key`) and nothing calls
+>   it. No client and no gateway mints a sealing keypair.
+> - **No HPKE, no AEAD, no KDF.** `ed25519-dalek` is the only cryptographic
+>   dependency in `fabric-kit`.
+> - **No attestation chain is verified.** F6 attestations are persisted (commit
+>   `8c63496`) and read back; nothing checks a chain of them, and F7 (§5.3) is not
+>   filed against the wire yet.
+> - **No roster-read wire path is implemented.** The shape is now ruled (§5.4:
+>   `TRoster`/`RRoster`, envelope 50/51), but nothing implements it, and today a
+>   device still cannot learn a peer's public key at all. Two record-side gaps
+>   block implementation (§5.4.7): the persisted attestation on `hub` `main` has
+>   no version field, and the reserved sealing-key storage cannot hold a
+>   verifiable key.
+> - **No capability enforcement.** Grants are household-wide prefix strings from
+>   an environment variable.
+> - **No revocation of anything.**
+
+Every bullet above except the capability and revocation ones was overtaken by
+QR-136 on 2026-08-20: X25519 sealing keys, RFC 9180 HPKE, XChaCha20-Poly1305
+content encryption, F7 attestation verification, and the 7-step roster verify
+path are all live and were live-verified end to end.
+
+</details>
 
 ---
 
