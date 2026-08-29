@@ -31,23 +31,26 @@ content as of `quickring/quickring.me@c043871`, not a git-history import.
 For the file history before this point, see that commit and its ancestors
 in `quickring/quickring.me`.
 
-**Known staleness, not fixed by this move**: `docs/encryption.md`'s own
-header is dated 2026-08-16 and describes a **pre-implementation** state
-("NOTHING IN THIS DOCUMENT IS IMPLEMENTED... no X25519 key, no AEAD, no
-HPKE, no ciphertext on the wire"). That's no longer true — the QR-136
-programme executed and was countersigned 2026-08-20: E0/E1 sealing
-round-trips are live-verified end-to-end in production, with real device
-pairing and real chat encryption shipping in Courier. **Updating this
-document to match the already-shipped implementation is real, separate
-work — flagged here, not done as part of this move.**
+~~**Known staleness, not fixed by this move**: `docs/encryption.md`'s own
+header is dated 2026-08-16 and describes a **pre-implementation**
+state.~~ **Fixed 2026-08-29 (CLUS-54).** `docs/encryption.md`'s status
+header, its §1.2 status table, and its §12 "what is NOT implemented"
+section now describe reality: the QR-136 programme executed and was
+countersigned 2026-08-20, and E0/E1 sealing round-trips are live-verified
+end to end, with real device pairing and real chat encryption shipping in
+Courier. One honest caveat is recorded there rather than papered over —
+`fabric-kit`'s current E0 path is live but not yet byte-conformant to
+§7, closed under QR-228 / QR-229.
 
 **Not yet done, tracked separately**: the `.proto` package is still named
 `quickring.v1`, not yet renamed to reflect Hearth (the coordinated Hearth
 rename pass under QR-33, marked governance-load-bearing 2026-08-22).
-Repos that currently vendor or build against the old
-`quickring/quickring.me` path for this proto (`hub`, `fabric-kit`,
-`gateway`, `courier`) have not been repointed at this repo yet — that's a
-real build-dependency migration, not done here.
+Repos that vendor or build against this proto have not all been repointed
+at this repo yet — that's a real build-dependency migration, not done
+here. `slash-builder/message-kit` **is** repointed (pinned to this repo's
+`935712a`, 2026-08-28); `fabric-kit`, `hub`, `gateway`, and `courier` are
+not. Docs across those repos that still name `quickring/quickring.me` as
+the schema's home were corrected on 2026-08-29 under CLUS-53.
 
 ## License
 
