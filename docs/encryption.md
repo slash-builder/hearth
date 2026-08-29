@@ -196,6 +196,21 @@ attestation this design does not have.
 | "It is cryptographically impossible for us to read your data." | **Never, under this design.** It would require hardware attestation (SEV-SNP / TDX / Nitro Enclaves) or a bootstrap that does not run on operator infrastructure. Neither exists here. |
 | Any present-tense claim of end-to-end encryption | **Not until E1 ships.** Any such sentence live today is false. |
 
+**Gate status, 2026-08-29 (CLUS-54).** The two E1-gated rows above have had
+their gate **met** — E1 shipped on 2026-08-20 (QR-136). They are left as
+written because the gate, not the verdict, is the durable part. What that
+means concretely:
+
+- The E1 rows are now defensible **only for content actually published
+  through the encrypting path**, and only for content published after the
+  household's content key existed (§11.2). A blanket "Hearth is end-to-end
+  encrypted" remains ahead of the code while §12's coverage gap is open.
+- The bootstrap-gated rows (§4.3) are **still gated**. `device0_seed_hex` has
+  not been deleted. Nothing about E1 shipping moves those.
+- Whether a met gate is actually *published* is a product call
+  (quickring-pm), not this document's. This section says what may be said,
+  never what should be.
+
 ---
 
 ## 3. Key hierarchy
