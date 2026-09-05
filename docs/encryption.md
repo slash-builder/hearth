@@ -1,10 +1,52 @@
 # Quickring Encryption — key management and content confidentiality
 
-**Status:** **SPECIFIED. NOTHING IN THIS DOCUMENT IS IMPLEMENTED.** As of
-2026-08-16 the only cryptographic primitive anywhere in the Quickring stack is
-Ed25519 signing (`ed25519-dalek`, in `fabric-kit`, `gateway`, and `hub`). There
-is no X25519 key, no AEAD, no HPKE, and no ciphertext on the wire. The hub reads
-every payload in plaintext and retains it for seven days.
+**Status, corrected 2026-09-05:** the paragraph below was accurate on
+2026-08-16 and was never updated as implementation proceeded — it sat
+unedited through three more weeks of real, shipped work (and a repo move,
+extracting this doc from `quickring/quickring.me` into this dedicated
+`slash-builder/hearth` spec repo) and was still being read and cited as
+current as of this correction. **It is false today.** Verified directly
+against running code, not against any doc, before writing this: **E0
+sealing and E1 household-content-key encryption are real, implemented, and
+in production use.** Concretely —
+
+- `fabric-kit/src/content_key.rs`: `grant_content_key`, `seal_content_key_to_roster`,
+  `verify_content_key_grant`, `ContentKeyGrant::{to_bytes,parse}` — shipped
+  2026-08-18 (`feat(crypto): E1 — ContentKeyGrant and QRE1 payload framing
+  primitives`, #9), hardened 2026-08-29 (`fix(QR-228/QR-229): route E0
+  through content_key.rs; delete the unauthenticated seal path`).
+- `hub/src/pairing.rs`: `record_device_sealing_key`/`record_pairing_attestation`/
+  `AttestationVersion` are real and live on `main` (F7 merged 2026-08-17,
+  PR #13) — the device sealing key is genuinely minted, bound, and stored,
+  not "reserved and unused."
+- **`quickring/courier`'s real, shipping chat feature already encrypts
+  every message with this.** `AppState.publishText` (the handler behind the
+  actual `ChatScreen` compose box) calls `E1Crypto.publishEncrypted`, gated
+  on `KeyState.keyResolved` and a real `householdContentKey`/
+  `householdContentKeyId` pair generated via `rust/src/api/crypto.rs`'s
+  `generate_household_content_key`/`seal_content_key_to_device`/
+  `unwrap_content_key`/`decrypt_delivery_if_sealed`. The code's own comment:
+  "replaces the mock XOR provider" — this went through a real placeholder
+  cycle before the genuine fabric-kit primitive landed (QR-147 cycle 2).
+
+**What this correction does NOT claim**: the full status table in §1.2
+below was written alongside the same 2026-08-16/18 snapshot and has the
+same staleness risk — only the rows above (device sealing key, content
+keys, and payload/E0 sealed-payload encryption) were re-verified against
+current code for this pass. The remaining rows (E2 per-resource keys, E3
+epochs/revocation, §8 capability tokens, §11 rollout specifics) have
+**not** been re-audited here and should not be assumed current without the
+same code-first check. Corrected rows are marked inline below; everything
+else retains its prior, unverified-since-08-18 status pending a fuller
+pass.
+
+**Original 2026-08-16 status paragraph, preserved for the historical
+record — no longer current, see above:** "SPECIFIED. NOTHING IN THIS
+DOCUMENT IS IMPLEMENTED. As of 2026-08-16 the only cryptographic primitive
+anywhere in the Quickring stack is Ed25519 signing (`ed25519-dalek`, in
+`fabric-kit`, `gateway`, and `hub`). There is no X25519 key, no AEAD, no
+HPKE, and no ciphertext on the wire. The hub reads every payload in
+plaintext and retains it for seven days."
 
 **Audience:** Quickring implementers, SDK developers, third-party implementors
 of the Hearth protocol.
@@ -51,20 +93,20 @@ ships.** This table is the single place to check.
 |---|---|---|---|
 | 2 | Threat model | — | **SPECIFIED** |
 | 3.1 | Device identity key (Ed25519) | pre-E0 | **IMPLEMENTED** (`gateway/identity.rs`, `fabric-kit/pairing.rs`) |
-| 3.2 | Device sealing key (X25519) | E0 | **SPECIFIED.** Hub-side storage reserved and unused (`hub/pairing.rs::set_device_sealing_key` — "nothing calls this yet"). No client or gateway mints one. |
-| 3.3–3.5 | Content keys, `key_id`, never-derive rule | E1 | **SPECIFIED. NOT IMPLEMENTED.** No content key exists in any household. |
-| 3.6 | Key epochs | E3 | **SPECIFIED, DEFERRED.** Field reserved, always `0` at E1. |
-| 4 | Root of authority vs. root of custody | E1 | **SPECIFIED.** Bootstrap rework in progress; current code (`api/src/device0.rs`) implements the superseded model. |
+| 3.2 | Device sealing key (X25519) | E0 | **IMPLEMENTED (corrected 2026-09-05).** `hub/src/pairing.rs::record_device_sealing_key` is real and live on `main`, called after v2 (F7) attestation verification succeeds — not "reserved and unused." Courier mints one client-side (`rust/src/api/crypto.rs::DeviceSealingKeypair::generate`). |
+| 3.3–3.5 | Content keys, `key_id`, never-derive rule | E1 | **IMPLEMENTED (corrected 2026-09-05).** Real household content keys exist: `rust/src/api/crypto.rs::generate_household_content_key`, sealed per-device via `seal_content_key_to_device`/verified via `unwrap_content_key`, tracked client-side as `AppState.householdContentKey`/`householdContentKeyId` (`KeyState.keyPending → keyResolved`, matching this section's own state names). Whether the never-derive rule and the exact `key_id` byte layout are honored to the letter has not been re-audited line-by-line for this correction — only that a real, non-mock content key now exists and is used, contra the prior row text. |
+| 3.6 | Key epochs | E3 | **SPECIFIED, DEFERRED.** Field reserved, always `0` at E1. (Not re-verified in this pass — status carried over from 2026-08-18.) |
+| 4 | Root of authority vs. root of custody | E1 | **SPECIFIED.** Bootstrap rework in progress; current code (`api/src/device0.rs`) implements the superseded model. (Not re-verified in this pass — status carried over from 2026-08-18.) |
 | 5.2 | Pairing attestation (F6) | E0 | **IMPLEMENTED.** Persisted by `hub/pairing.rs` (commit `8c63496`, extended by F7 below). |
-| 5.3 | F7 — attestation covers the sealing key | E0 | **IMPLEMENTED.** `TPairClaim`/`DPairClaim`/`TPairApprove` fields are in `protocol.md`. Hub-side v2 material and version discrimination are on `hub` `main` (PR #13, merged 2026-08-17). |
-| 5.4 | Roster read (D3) | E0 | **SPECIFIED, IMPLEMENTABLE NOW.** `TRoster`/`RRoster`, envelope 50/51 — ruled by messaging-architect 2026-08-17. The two record-side gaps this section originally named are already resolved on `hub` `main` (§5.4.7) — not yet implemented, but not blocked. |
-| 5.6 | Content-key delegation exchange | E1 | **SPECIFIED. NOT IMPLEMENTED.** |
-| 6 | Payload encryption | E1 | **SPECIFIED. NOT IMPLEMENTED.** Every payload on the fabric is plaintext today. |
-| 7 | Sealed payloads | E0 | **SPECIFIED. NOT IMPLEMENTED.** |
-| 8 | Capability seam | — | **SPECIFIED.** Capability core not implemented. |
-| 9 | Revocation and rekey | E3 | **SPECIFIED, DEFERRED to 2028.** |
-| 10 | Self-host decoupling | — | **SPECIFIED and verified against this design.** |
-| 11 | Rollout and migration | E1 | **SPECIFIED.** One open product call (§11.5). |
+| 5.3 | F7 — attestation covers the sealing key | E0 | **IMPLEMENTED.** `TPairClaim`/`DPairClaim`/`TPairApprove` fields are in `protocol.md`. Hub-side v2 material and version discrimination are on `hub` `main` (PR #13, merged 2026-08-17) — re-confirmed live 2026-09-05. |
+| 5.4 | Roster read (D3) | E0 | **SPECIFIED, IMPLEMENTABLE NOW.** `TRoster`/`RRoster`, envelope 50/51 — ruled by messaging-architect 2026-08-17. The two record-side gaps this section originally named are already resolved on `hub` `main` (§5.4.7) — not yet implemented, but not blocked. (Not re-verified in this pass.) |
+| 5.6 | Content-key delegation exchange | E1 | **AT LEAST PARTIALLY IMPLEMENTED (corrected 2026-09-05).** Courier's real `KeyState` lifecycle (`keyPending`/`keyResolved`/`keyExpired`) and `seal_content_key_to_device`/`unwrap_content_key` primitives match this section's own described exchange shape. Whether the full `qr.view/invoke /keys/request` wire path (as opposed to some narrower direct-grant path) is what Courier actually runs end-to-end has not been confirmed line-by-line for this correction — flagging as "at least partially real," not blindly upgrading to fully IMPLEMENTED. Worth a real, dedicated re-audit rather than inferring further from this pass. |
+| 6 | Payload encryption | E1 | **IMPLEMENTED (corrected 2026-09-05).** Contra the prior text ("every payload on the fabric is plaintext today") — Courier's real, shipping `ChatScreen`/`AppState.publishText` encrypts every sent message via `E1Crypto.publishEncrypted` calling the real fabric-kit primitive, gated on a resolved household content key. The code's own comment notes this replaced an earlier "mock XOR provider," i.e. a placeholder existed and was since replaced with the real thing. |
+| 7 | Sealed payloads | E0 | **IMPLEMENTED (corrected 2026-09-05).** `seal_content_key_to_device`/`unwrap_content_key`/`decrypt_delivery_if_sealed` in `rust/src/api/crypto.rs` are the real, real-per-device single-recipient sealing primitives this section specifies — not confirmed byte-for-byte against §7's exact wire layout in this pass, but genuinely implemented and in use, not absent. |
+| 8 | Capability seam | — | **SPECIFIED.** Capability core not implemented. (Not re-verified in this pass — status carried over from 2026-08-18.) |
+| 9 | Revocation and rekey | E3 | **SPECIFIED, DEFERRED to 2028.** (Not re-verified in this pass.) |
+| 10 | Self-host decoupling | — | **SPECIFIED and verified against this design.** (Not re-verified in this pass.) |
+| 11 | Rollout and migration | E1 | **SPECIFIED.** One open product call (§11.5). (Not re-verified in this pass — given §6/§3.3-3.5 are now confirmed implemented, this section's own migration narrative likely needs a fresh look too; flagging rather than rewriting blind.) |
 
 **The programme labels** (E0–E4) are the confidentiality decomposition:
 
