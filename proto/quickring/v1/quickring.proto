@@ -315,27 +315,153 @@ message TPublish {
   //
   // HUB-VISIBLE PLAINTEXT. Unlike `payload`, this is metadata the hub reads,
   // indexes and stores, so it remains readable on an E2E topic where the
-  // payload is not. A producer on an E2E topic SHOULD use an opaque or hashed
-  // key rather than a human-meaningful path.
+  // payload is not.
   //
-  // RECOMMENDED ceiling 256 bytes; a hub MAY reject longer with
+  // Length ceiling 256 bytes on every topic; longer is
   // RETENTION_KEY_INVALID (25). NOT TOPIC_INVALID — the topic is fine and
   // naming it would send the client looking at the wrong input.
   //
-  // Distinct-key cardinality per (account, topic) MUST be capped by the hub:
-  // an uncapped key space turns one authenticated publisher into an unbounded
-  // write amplifier, which is the failure mode this field would otherwise
-  // introduce. Exceeding that cap is RETENTION_KEY_LIMIT_EXCEEDED (26), NOT
-  // PUBLISH_RATE_LIMITED — retained slots have no TTL, so the condition is a
-  // GAUGE that does not decay, and a rate-limit code would invite a retry that
-  // can never succeed and a `retry_after_ms` hint that would be a lie.
+  // ======================================================================
+  // SECURITY RULING (security-engineer, 2026-09-06). NORMATIVE.
+  // Supersedes the earlier "producers SHOULD use an opaque key" and the
+  // "a hub MAY require a specific opaque form" framing. Both were too weak,
+  // for a reason the weaker framing itself identified but then mis-scoped —
+  // see the ENFORCEMENT note at the end.
+  // ======================================================================
   //
-  // A hub MAY additionally require a specific opaque form for keys on a sealed
-  // topic and reject others with RETENTION_KEY_INVALID. Note the limit of what
-  // such a check can buy: a hub holds no content key, so it can only verify
-  // SHAPE, and any shape rule is satisfiable by a client that simply encodes
-  // its path. It raises the floor against accidental leakage; it is not a
-  // confidentiality guarantee, and it MUST NOT be described as one.
+  // (1) OPACITY IS MANDATORY ON SEALED TOPICS.
+  //
+  // On a SEALED topic — one whose `payload_type` is the `qr.seal/box`
+  // sentinel (encryption.md §6.5) — a non-empty `retention_key` MUST be the
+  // OPAQUE FORM defined in (2). A producer that sends
+  // `/ha/services/lock/unlock` here is rejected, not merely discouraged.
+  //
+  // WHY THIS IS NOT ALREADY COVERED BY THE METADATA CONCEDED IN §2.3.
+  // encryption.md §2.3 concedes topic, sender, timestamp, frame size and
+  // publish cadence to the hub permanently. Every one of those is
+  // STRUCTURAL — it says how much traffic moved and between whom. A
+  // human-meaningful `retention_key` would be the first field on this wire
+  // to hand the hub a SEMANTIC, CONTENT-DERIVED LABEL: not "this house
+  // published 240 frames today" but "this house has an alarm panel, and here
+  // is the timestamp of every disarm." Different category, not a larger
+  // helping of the same one, and so not covered by anything §2.3 accepted.
+  //
+  // This is the same call D4 made for `payload_type`, and it lands in the
+  // same place for the same reason. D4's REMEDY, though — wrap the field
+  // inside the ciphertext — is UNAVAILABLE here, and that difference is why
+  // this field needed its own ruling rather than inheriting D4's: the hub has
+  // no legitimate use for `payload_type` and never reads it, whereas the hub
+  // MUST read `retention_key` to key the slot at all. It cannot be hidden. So
+  // it is BLINDED instead.
+  //
+  // (2) THE OPAQUE FORM.
+  //
+  //   K_rk = HKDF-SHA256(ikm  = household content key,
+  //                      salt = "",
+  //                      info = "qr-retention-key-v1" ‖ 0x00
+  //                             ‖ len16(key_id) ‖ key_id)
+  //   tag  = HMAC-SHA256(K_rk, len16(path) ‖ path_utf8)[0..16]
+  //   retention_key = base64url(tag), no padding  ->  exactly 22 chars
+  //
+  // Context string registered per encryption.md Appendix A convention
+  // (ASCII, 0x00 terminator, length-prefixed variable fields).
+  //
+  // KEYED, not a bare hash, and that is the load-bearing part of the whole
+  // ruling. A bare SHA-256 of a view path is IDENTICAL IN EVERY HOUSEHOLD:
+  // the hub precomputes a dictionary of a few thousand well-known Home
+  // Assistant paths once and reverses every key forever, and can additionally
+  // correlate two accounts as the same physical house by their matching
+  // hashes. Deriving under the household content key — which the hub does not
+  // have, by E1's entire construction — defeats both at once. No dictionary
+  // is computable, and the same path under two households yields two
+  // unrelated keys. "Hashed" without "keyed" would have bought nothing.
+  //
+  // Derived from the content key VIA HKDF rather than used directly, for
+  // domain separation, and bound to `key_id` so an E3 epoch bump rotates
+  // retention keys along with content keys. Consequence, stated here rather
+  // than discovered later: an epoch bump ORPHANS every retained slot. That is
+  // correct — those slots hold ciphertext under the retired key and were
+  // already undecryptable.
+  //
+  // (3) INTEGRITY — the half that is easy to miss, and the sharper problem.
+  //
+  // §6.3 binds ONLY topic and sender_device_id into the AEAD's AAD.
+  // `retention_key` is therefore not merely hub-READABLE, it is HUB-MUTABLE
+  // WITH NO DETECTION ANYWHERE. A hub can move a retained value from the slot
+  // it was published under to a different one and the recipient's AEAD tag
+  // still verifies, because nothing the tag covers has changed. Concretely: a
+  // hub takes the ciphertext published for the front door's lock state and
+  // serves it as the back door's, and the client renders "locked" for a door
+  // that is not. The retained slot is exactly the value a client trusts at
+  // subscribe time to establish initial state, which makes this the worst
+  // place in the protocol for a silent substitution to be possible.
+  //
+  // The fix does NOT change the AAD — E1's zero-envelope-change property
+  // holds, and the AAD is messaging-architect's to change, not this field's.
+  // Instead the true `path` travels INSIDE the QRE1 ciphertext, in the inner
+  // plaintext, by the same mechanism D4 already established for carrying the
+  // real `payload_type`.
+  //
+  // NORMATIVE, ON THE RECIPIENT: before applying a retained value, recompute
+  // the opaque form from the inner `path` and compare it against the
+  // delivered `retention_key` in constant time. On mismatch, FAIL CLOSED —
+  // discard the delivery and surface it as a failure. Never render it, and
+  // never fall back to trusting the hub-supplied key.
+  //
+  // This is where the real confidentiality and integrity guarantees live:
+  // client-side, under a key the hub does not hold. The hub check in (4) is a
+  // backstop, not the mechanism.
+  //
+  // (4) HUB-SIDE ENFORCEMENT — mandatory, and honest about its limit.
+  //
+  // A hub MUST reject a non-empty `retention_key` on a sealed topic unless it
+  // is exactly 22 base64url characters ([A-Za-z0-9_-], no padding), with
+  // RETENTION_KEY_INVALID. MUST, not MAY: an enforcement point that each hub
+  // may individually decline to apply is not an enforcement point, and the
+  // producer-side MUST in (1) needs something that actually fails closed when
+  // a producer gets it wrong.
+  //
+  // The limit is real and is stated rather than papered over: the hub holds
+  // no content key, so it verifies SHAPE ONLY, and a client determined to
+  // encode meaning into 16 bytes can still do so. That is accepted. The
+  // adversary this field is hardened against is A-hub (encryption.md §2.1),
+  // not a household's own gateway, and a gateway that deliberately defeats
+  // the derivation leaks only its own household. What the shape check does
+  // buy is the failure mode that will ACTUALLY occur: a producer passing a
+  // live view path straight through, which is precisely what the gateway does
+  // today and would keep doing under a SHOULD.
+  //
+  // The EMPTY key stays valid and is exempt on sealed topics — it is the
+  // topic's single unnamed slot and discloses nothing.
+  //
+  // (5) CARDINALITY CAP: 256 distinct keys per (account, topic).
+  //
+  // MUST be capped — an uncapped key space turns one authenticated publisher
+  // into an unbounded write amplifier, and unlike the 7-day catch-up log a
+  // retained slot has NO TTL, so what it amplifies into is PERMANENT storage.
+  // Exceeding the cap is RETENTION_KEY_LIMIT_EXCEEDED (26), NOT
+  // PUBLISH_RATE_LIMITED: a gauge that does not decay, so a rate-limit code
+  // would invite a retry that can never succeed and a `retry_after_ms` hint
+  // that would be a lie.
+  //
+  // 256 is sized against the real workload, not invented: qr-gateway
+  // multiplexes SHARED PATHS onto one `account/<id>/broadcast` — about 9 in
+  // the live household, and the unit is a grant-scoped prefix
+  // (`/ha/services/light`), not one key per entity. That is ~28x headroom,
+  // while bounding the hostile case at 256 x 64 KiB = 16 MiB of permanent
+  // storage per (account, topic).
+  //
+  // OVER THE CAP THE HUB MUST REJECT THE PUBLISH. It MUST NOT evict the
+  // oldest key to make room. Silent eviction would let an attacker who can
+  // reach the cap delete a legitimate slot — the front door's lock state, say
+  // — converting a hub-capacity problem into STATE SUPPRESSION against the
+  // household. Rejecting preserves every existing slot and refuses only the
+  // new thing, which is the fail-closed direction.
+  //
+  // NORMATIVE: the cap applies ONLY to keys NOT ALREADY PRESENT. A publish to
+  // an already-existing key MUST be allowed even at the cap — otherwise
+  // reaching the cap freezes every state update the household has, which is
+  // the denial of service the cap exists to prevent.
   optional string retention_key = 6;
 }
 
@@ -834,6 +960,9 @@ message ErrorDetails {
     // Set for the rate-limit family: 23 PUBLISH_RATE_LIMITED,
     // 24 SUBSCRIBE_RATE_LIMITED, 50 ROSTER_RATE_LIMITED.
     RateLimitDetails rate_limit = 1;
+
+    // Set for 26 RETENTION_KEY_LIMIT_EXCEEDED.
+    RetentionKeyLimitDetails retention_key_limit = 2;
   }
 }
 
@@ -878,4 +1007,29 @@ enum RateLimitScope {
   RATE_LIMIT_SCOPE_CONNECTION = 1;
   // The account-wide limiter, shared by every device on the account.
   RATE_LIMIT_SCOPE_ACCOUNT = 2;
+}
+
+// Detail for 26 RETENTION_KEY_LIMIT_EXCEEDED — the distinct-`retention_key`
+// cardinality cap per (account, topic).
+//
+// The second arm of `ErrorDetails`, and incidentally its first real test: it
+// was added without renegotiating anything with RateLimitDetails, which is
+// exactly the property the wrapper was chosen for.
+//
+// Deliberately NO retry hint. Unlike the rate-limit family, waiting does not
+// help — a retained slot has no TTL, so the cap does not decay on its own, and
+// the producer's only recovery is to publish fewer distinct keys. A
+// `retry_after_ms` here would be an outright lie about that.
+message RetentionKeyLimitDetails {
+  // The cap that was exceeded — distinct retention keys allowed per
+  // (account, topic). Sent so a client can report a real number to its
+  // operator instead of a bare failure, and so the hub can be retuned without
+  // every client shipping a hardcoded copy of the limit.
+  uint32 limit = 1;
+
+  // How many distinct keys the (account, topic) currently holds. Normally
+  // equal to `limit` at the moment of rejection; carried separately because it
+  // is the number that actually moves, and a client comparing the two across
+  // retries can tell "still full" from "the cap was lowered under me".
+  uint32 current = 2;
 }
