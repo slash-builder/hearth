@@ -612,11 +612,21 @@ message TPublish {
   //   "comment" — feed comment
   //   "dm" — direct message
   //   "presence_rich" — extended presence state
-  //   "signal" — WebRTC signaling for file transfer (v1.5+)
+  //   "signal" — WebRTC signaling for file transfer / media (v1.5+)
   //   "bitchain_ref" — Bitchain manifest reference, payload contains
   //                    a bitchain:// URI or serialised manifest pointer
   //                    (v1.5+; see file transfer note below)
+  //   "qr.view/invoke" — gateway remote-invoke request { path, args }
+  //   "qr.view/patch"  — gateway shared-view snapshot/patch frame
+  //   "qr.view/reply"  — reply to a "qr.view/invoke", correlated by an
+  //                    in-body `in_reply_to` = the request's RPublish
+  //                    `message_id` (see "Application-layer request/reply"
+  //                    below)
   optional string payload_type = 4;
+
+  // QR-210. When true, deliver LIVE but do not write to the 7-day catch-up
+  // store — see "Non-retained publishes" under Offline catch-up.
+  optional bool no_retain = 5;
 }
 
 message RPublish {
@@ -808,6 +818,50 @@ The server's short-TTL message store (DynamoDB) retains messages
 for **7 days** in v1. `TCatchUp` with `since_ms` older than 7 days
 returns `RError(code=CATCHUP_HORIZON_EXCEEDED)` and the client
 should treat its local state as authoritative going forward.
+
+### Non-retained publishes (`TPublish.no_retain`, QR-210)
+
+A `TPublish` with `no_retain = true` is delivered live to every current
+subscriber exactly as normal, but is **never written to the catch-up
+store**. A device offline at publish time will not see it via `TCatchUp` —
+that is the point. Everything else about the publish is unchanged: the
+sender still gets an `RPublish`, `client_message_id` dedup still applies,
+rate limits still apply, and the hub still never reads the payload. It is
+purely a retention hint, and the hub interprets it as nothing else.
+
+This exists for traffic that is only meaningful in the moment and is
+undesirable to keep at rest. The motivating case is WebRTC signaling
+(`payload_type = "signal"`): an SDP offer embeds the LAN topology (host ICE
+candidates, Docker bridge subnets) and the public IP of both peers, has
+zero catch-up value once its negotiation window closes, and per the QR-206
+security ruling MUST be non-retained (or the frame sealed) before any
+`signal`-typed publish ships. A producer that needs the guarantee must
+confirm the hub's negotiated version — a hub predating field 5 ignores it
+and retains, like any additive field.
+
+### Application-layer request/reply over publish (`qr.view/*`)
+
+Request/reply between two devices does **not** get its own envelope
+variant — `qr.view/invoke`, `qr.view/patch`, and `qr.view/reply` are
+`payload_type` conventions carried inside ordinary `TPublish`/`DDeliver`
+frames on the account broadcast topic, and the value space is app-owned
+(see the resolved `payload_type` note in the design decisions). This keeps
+the envelope's fixed message set intact (the protocol-minimalism
+invariant): a new interaction is a new payload_type string, not a new wire
+message.
+
+Correlation follows the T/R/D grammar without inventing a second one. The
+*envelope* tag correlates a `TPublish` to its `RPublish` (the publish
+receipt), one reply per tag, exactly as always. The *application-layer*
+request→reply correlation is separate and rides in the payload: a
+`qr.view/reply` body carries `in_reply_to` = the `message_id` the
+requester's `RPublish` assigned to its `qr.view/invoke` frame. This is
+required precisely because the reply arrives later, as an unsolicited
+`DDeliver` on `tag = 0` — the same "anything that must signal later is a D,
+never a second R" rule pairing already uses (`RPairClaimed` now,
+`DPairResult` later). This convention is already implemented and tested in
+Fabric Kit's key-admission exchange (`encryption.md` §5.6) and is reused
+verbatim by media/WebRTC signaling — one mechanism, both consumers.
 
 ---
 

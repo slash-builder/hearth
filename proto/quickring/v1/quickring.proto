@@ -235,6 +235,31 @@ message TPublish {
   bytes payload = 2;                    // opaque to the hub; ciphertext on E2E topics
   optional string client_message_id = 3; // dedup key; (account_id, id) held 10 min in Redis
   optional string payload_type = 4;      // app-layer hint, never interpreted by the hub
+
+  // QR-210 (additive; field 5). When true, the hub delivers this publish
+  // LIVE to current subscribers exactly as normal but MUST NOT write it to
+  // the 7-day catch-up store (TCatchUp/RCatchUp). A device that was offline
+  // when a no_retain publish was sent will never receive it via catch-up —
+  // that is the point.
+  //
+  // This exists for ephemeral, high-frequency, sensitive-at-rest traffic
+  // that is only meaningful in the moment — the motivating case is WebRTC
+  // signaling (payload_type = "signal"), whose SDP offers embed LAN
+  // topology (host ICE candidates, Docker bridge subnets) and the public IP
+  // of both peers. Retaining that for 7 days on the hub is a needless
+  // standing disclosure of household network shape, and a signaling frame
+  // has zero catch-up value the instant its negotiation window closes.
+  // security-engineer's QR-206 ruling makes non-retention (or a sealed
+  // frame) a HARD GATE on shipping any "signal"-typed publish.
+  //
+  // Absent / false → unchanged behavior: the publish is retained for 7 days
+  // like every other publish. The hub NEVER interprets this as anything
+  // other than a retention hint; it does not affect authorization, rate
+  // limiting, dedup (client_message_id still works), fanout, or the
+  // RPublish the sender gets back. Old hubs that predate this field ignore
+  // it and retain — a producer that needs the guarantee must confirm the
+  // hub's negotiated version, exactly as with any additive field.
+  optional bool no_retain = 5;
 }
 
 message RPublish {
