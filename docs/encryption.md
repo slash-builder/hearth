@@ -395,6 +395,56 @@ gateway. Never `shared_preferences`. Never an environment variable — a secret 
 `Environment=` is visible to `systemctl show`. Never a file inside a directory
 that a backup or sync tool sweeps by default.
 
+The OS keyring above means an **interactive** process (Courier, a CLI the user
+runs). It is not a store for an unattended service: Secret Service needs an
+unlocked login collection and a D-Bus session, neither of which exists before
+login. Unattended services follow the next paragraph.
+
+**Credentials held for an upstream, and unattended services (ruled 2026-10-06).**
+A glue or gateway service that authenticates to a third-party system (a Jenkins
+API token, a GitHub token, a Jira credential) is covered by the same rule as the
+keys above. The unattended-service rule has these parts:
+
+- **Delivery.** The supervisor hands the service each secret as a file in a
+  private directory named by `$CREDENTIALS_DIRECTORY`, or, where there is no
+  such supervisor, as an inherited file descriptor or pipe. The service
+  reads it through one loader (`qr-glue-core`), and the loader MUST fail
+  closed when the credential is absent. The service's configuration holds a
+  *reference* to the credential by name, never its value. The secret MUST NOT
+  appear in an environment variable, in argv, in a unit file, or in a log or
+  journal line.
+- **At rest, per platform.** Linux with systemd: `systemd-creds` and
+  `LoadCredentialEncrypted=` (for a per-user service, `systemd-creds --user`).
+  macOS and Windows: Keychain or Credential Manager, read by the supervising
+  app and passed over a pipe. A container: a mounted secret file. Where none
+  of these exists: a mode-0600 file under `$XDG_STATE_HOME`. Courier itself
+  keeps using platform secure storage as above.
+- **No TPM is required.** Binding to the host key alone is the accepted
+  baseline. It defends against a credential leaking through a backup, a copy of
+  the file, a log, or a transcript. It does **not** defend against root, and it
+  does not defend against other code running as the same user. A TPM-bound
+  credential is an allowed hardening where a TPM exists, never a requirement.
+- **Two install shapes, both supported.** *Single-user:* the services run as
+  the user's own systemd user units, under linger so they run without a
+  login session. *Family (shared household):* the services run as a dedicated
+  system user, so a household member's session, or code running as one, does
+  not share an identity with the services, and the credentials are readable by
+  that service user only. The family shape needs root at install. Neither is
+  the default yet. The loader and the credential reference are identical in
+  both, so the choice is a deployment decision, not a code change.
+- **Always on.** These services MUST run without a logged-in user, and so MUST
+  NOT depend on a desktop keyring being unlocked.
+- **Not a capability.** An upstream credential is never placed in a capability
+  token: tokens are signed, not encrypted (§8.1). Capabilities control who may
+  reach the service; the credential is what the service sends upstream.
+- **Rotation and revocation.** Rotation replaces the sealed credential with an
+  atomic 0600 write and restarts the unit. Revocation happens upstream;
+  deleting the local copy is hygiene, not revocation, and uninstalling a service
+  MUST delete its sealed credential. A service that receives HTTP 401, or a
+  redirect to a login page, from an upstream MUST treat that as an
+  authentication failure and stop retrying until its credential changes or it
+  is explicitly retried. It MUST NOT fall back to anonymous access.
+
 ### 3.6 Key epochs — defined now, unused until E3
 
 The `epoch` field (`u32`) exists in the ciphertext header and in the content-key
