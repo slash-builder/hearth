@@ -31,16 +31,6 @@ content as of `quickring/quickring.me@c043871`, not a git-history import.
 For the file history before this point, see that commit and its ancestors
 in `quickring/quickring.me`.
 
-**Known staleness, not fixed by this move**: `docs/encryption.md`'s own
-header is dated 2026-08-16 and describes a **pre-implementation** state
-("NOTHING IN THIS DOCUMENT IS IMPLEMENTED... no X25519 key, no AEAD, no
-HPKE, no ciphertext on the wire"). That's no longer true — the QR-136
-programme executed and was countersigned 2026-08-20: E0/E1 sealing
-round-trips are live-verified end-to-end in production, with real device
-pairing and real chat encryption shipping in Courier. **Updating this
-document to match the already-shipped implementation is real, separate
-work — flagged here, not done as part of this move.**
-
 **Not yet done, tracked separately**: the `.proto` package is still named
 `quickring.v1`, not yet renamed to reflect Hearth (the coordinated Hearth
 rename pass under QR-33, marked governance-load-bearing 2026-08-22).
@@ -48,6 +38,63 @@ Repos that currently vendor or build against the old
 `quickring/quickring.me` path for this proto (`hub`, `fabric-kit`,
 `gateway`, `courier`) have not been repointed at this repo yet — that's a
 real build-dependency migration, not done here.
+
+## Encryption: implementation status
+
+Checked against the reference implementations' source on 2026-10-27.
+`docs/encryption.md` is both the design and, in §1.2, a status table. Its
+header was corrected on 2026-09-05 (it had described a state where nothing
+was implemented), but only some rows were re-audited then, and the code has
+moved since. Where `docs/encryption.md` and the code disagree, the code is
+what runs; this section is the current summary. Parts of
+`docs/encryption.md` known to be behind the code: §1.2 rows 5.4 and 5.6, the
+bootstrap description in §4, and §12.
+
+Implemented in the reference client SDK (Fabric Kit) and the reference hub,
+and exercised by their integration tests against a live hub and Redis:
+
+- A per-device sealing key, minted on the device at pairing claim, bound to
+  the device's identity key, recorded by the hub, and covered by the pairing
+  attestation.
+- Roster read (`TRoster`/`RRoster`) with client-side verification of the
+  attestation chain. A roster entry that fails verification is treated as
+  absent.
+- E0 as used today: sealing a household content key to each device on the
+  roster (`ContentKeyGrant`, `docs/encryption.md` §5.7). The standalone
+  `SealedBlob` for arbitrary payloads (§7.2) is **not** implemented.
+- E1: payload encryption under a household content key
+  (`FabricClient::publish_encrypted`, `Subscription::decrypt_if_sealed`).
+- The key-admission exchange between two devices (§5.6).
+
+In the reference app (Courier), as read from source (its tests were not run
+for this check):
+
+- The chat send path encrypts each message under E1 and returns an error
+  instead of sending when no content key is present. Other publishes, such as
+  device-control messages, are not E1-sealed.
+- The household content key is provisioned by hand through a beta tool
+  (generate, or paste a key). The app does not run the key-admission
+  exchange.
+- The content key, the identity seed, and the sealing seed are stored in
+  ordinary app preferences, not in platform secure storage, which
+  `docs/encryption.md` §3.5 requires.
+- The household authority-root handoff (§4) exists in the SDK and the
+  service, but no app code calls it.
+
+Not implemented: per-resource keys (E2); key rotation and rekey-on-revoke
+(E3; the epoch field is carried in the formats and the SDK has no rotation
+logic); forward secrecy and key transparency (E4).
+
+What this means for a reader:
+
+- The hub still sees message metadata (topic, sender, timing, size);
+  encryption does not change that (`docs/encryption.md` §2.3).
+- Frames published before a household has a content key are plaintext to the
+  hub (`docs/encryption.md` §11.2).
+- The public-claim gates in `docs/encryption.md` §2.4 for custody claims
+  (for example "your household key never leaves your device", "we cannot
+  access your household") are not met by the shipped app today. Nothing in
+  this repository makes those claims.
 
 ## License
 
