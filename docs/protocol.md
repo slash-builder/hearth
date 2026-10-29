@@ -5,7 +5,8 @@ pub/sub, presence digest) is live in the hub (`quickring/hub`), Fabric Kit, and
 the v0 agent. Checked against the reference hub's source on 2026-10-27, it
 also implements pairing, offline catch-up, `DPresence`, publish dedup, rate
 limits, and roster read (`TRoster`). `TUnsubscribe` is defined in the schema
-but the reference hub has no handler for it. E2E: the hub relays payloads as
+but the reference hub has no handler for it: it answers with
+`RError(UNKNOWN_MESSAGE_TYPE)`. E2E: the hub relays payloads as
 opaque bytes, and client-side sealing (E0, E1) is implemented in the reference
 client SDK (Fabric Kit); per-level status and its limits are in
 [`encryption.md`](encryption.md) §1.2 and the README's "Encryption:

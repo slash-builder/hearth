@@ -34,14 +34,19 @@ in `quickring/quickring.me`.
 **Not yet done, tracked separately**: the `.proto` package is still named
 `quickring.v1`, not yet renamed to reflect Hearth (the coordinated Hearth
 rename pass under QR-33, marked governance-load-bearing 2026-08-22).
-Repos that currently vendor or build against the old
-`quickring/quickring.me` path for this proto (`hub`, `fabric-kit`,
-`gateway`, `courier`) have not been repointed at this repo yet — that's a
-real build-dependency migration, not done here.
+Repointing at this repo is largely done: message-kit's vendored schema
+(`proto/VENDORED.md`) and the hub's pin a copy of this repo's
+`proto/quickring/v1/quickring.proto`, fabric-kit takes its generated types
+from message-kit, and the gateway and Courier vendor no schema of their own
+(they go through fabric-kit). Some stale `quickring/quickring.me` references
+remain in comments and docs (for example fabric-kit's `Cargo.toml`), and the
+`quickring.v1` package-name rename is the part still open.
 
 ## Encryption: implementation status
 
-Checked against the reference implementations' source on 2026-10-27.
+Checked against the reference implementations' source on 2026-10-27. Those
+reference implementations (hub, Fabric Kit, the apps) are not public yet, so
+readers cannot check these claims against the code themselves.
 `docs/encryption.md` is both the design and, in §1.2, a status table. Its
 header was corrected on 2026-09-05 (it had described a state where nothing
 was implemented), but only some rows were re-audited then, and the code has
