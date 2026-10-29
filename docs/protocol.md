@@ -2,8 +2,16 @@
 
 **Status:** v0 implemented (2026-06-06, tag `v0`) — the v0 subset (sessions,
 pub/sub, presence digest) is live in the hub (`quickring/hub`), Fabric Kit, and
-the v0 agent. Pairing, catch-up, `DPresence`, unsubscribe, dedup, rate limits,
-and E2E remain spec-only. Canonical schema: [`../proto/quickring/v1/quickring.proto`](../proto/quickring/v1/quickring.proto).
+the v0 agent. Checked against the reference hub's source on 2026-10-27, it
+also implements pairing, offline catch-up, `DPresence`, publish dedup, rate
+limits, and roster read (`TRoster`). `TUnsubscribe` is defined in the schema
+but the reference hub has no handler for it: it answers with
+`RError(UNKNOWN_MESSAGE_TYPE)`. E2E: the hub relays payloads as
+opaque bytes, and client-side sealing (E0, E1) is implemented in the reference
+client SDK (Fabric Kit); per-level status and its limits are in
+[`encryption.md`](encryption.md) §1.2 and the README's "Encryption:
+implementation status". Per-resource keys (E2) and later levels are
+spec-only. Canonical schema: [`../proto/quickring/v1/quickring.proto`](../proto/quickring/v1/quickring.proto).
 **Audience:** Quickring hub developers, SDK developers, third-party
 integrators.
 **Scope:** The full Quickring wire standard — both the **base layer** (the
@@ -1771,8 +1779,8 @@ Captured for resolution before v0 implementation begins.
    `RPairClaimed` and approval, the push has nowhere to go. Options:
    the new device polls a `TPair(step=POLL)` on reconnect, or the
    pairing bootstrap connection supports the normal resume
-   mechanism. Needs a decision before pairing is implemented (v1,
-   not v0), but doesn't affect the v0 plaintext demo.
+   mechanism. Not resolved in the schema: `PairStep` has no `POLL` step,
+   and the reference hub implements pairing without one.
 
 ---
 
