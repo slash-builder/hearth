@@ -4,7 +4,8 @@
 pub/sub, presence digest) is live in the hub (`quickring/hub`), Fabric Kit, and
 the v0 agent. Checked against the reference hub's source on 2026-10-27, it
 also implements pairing, offline catch-up, `DPresence`, publish dedup, rate
-limits, and roster read (`TRoster`). `TUnsubscribe` is defined in the schema
+limits (except the carrier-session rate, below), and roster read
+(`TRoster`). `TUnsubscribe` is defined in the schema
 but the reference hub has no handler for it: it answers with
 `RError(UNKNOWN_MESSAGE_TYPE)`. E2E: the hub relays payloads as
 opaque bytes, and client-side sealing (E0, E1) is implemented in the reference
@@ -12,18 +13,26 @@ client SDK (Fabric Kit); per-level status and its limits are in
 [`encryption.md`](encryption.md) §1.2 and the README's "Encryption:
 implementation status". Per-resource keys (E2) and later levels are
 spec-only. Canonical schema: [`../proto/quickring/v1/quickring.proto`](../proto/quickring/v1/quickring.proto).
+The reference hub does not yet apply the carrier-session-rate limit
+(5/minute per account from new IPs), which predates 2026-11-11 under the
+name "Connection rate".
 Rules added on 2026-11-11 that the reference implementations do not yet
 follow (checked against their source that day): the reference hub does
 not echo the `quickring.v1` subprotocol; resets its idle timer on
 WebSocket Ping/Pong frames; re-validates a session's registration only
-when a `TPing` arrives, not on its own clock; does not enforce a
-negotiated `max_envelope_size` lower than 1 MiB; has no
-carrier-session-rate limit; has no 10-second establishment deadline
-(only the 90-second idle timer); and closes on an oversized message
-without close code 1009. Fabric Kit does not offer `quickring.v1`, does
-not fail an upgrade response that names a subprotocol it did not offer,
-and does not bound received messages at the 1 MiB ceiling before
-buffering them (its WebSocket library's defaults allow far more).
+when a `TPing` arrives, not on its own clock, and treats a re-validation
+check that errors as passed, with no time limit; does not enforce a
+negotiated `max_envelope_size` lower than 1 MiB; does not limit
+carrier-session establishment or unauthenticated sessions per source
+address; has no 10-second establishment deadline (only the 90-second
+idle timer); does not close the session on a zero-length binary
+message; and closes on an oversized message without close code 1009.
+Fabric Kit does not offer `quickring.v1`, does not fail an upgrade
+response that names a subprotocol it did not offer, sends
+`TVersion.max_envelope_size` as 0 and does not enforce a negotiated
+ceiling, and does not bound received messages at the 1 MiB ceiling
+before buffering them (its WebSocket library's defaults allow far
+more).
 Interoperability is unaffected in the meantime, because absence of a
 subprotocol is tolerated in both directions and `TVersion` does all
 version work.
@@ -180,8 +189,9 @@ Any conforming carrier MUST:
    `client_message_id` recovers a publish.
 2. **Carry envelope bytes verbatim and opaquely.** A carrier MUST NOT
    lift any envelope field (topic, tag, message or device ids, payload
-   type) or any credential, including `THello.bearer_token`,
-   `THello.device_key_signature` and `THello.resume_token`, into
+   type) or any credential carried in an envelope, including
+   `THello.bearer_token`, `THello.device_key_signature` and
+   `THello.resume_token`, into
    carrier metadata: URLs, query strings, headers, event names. This
    keeps what an intermediary can observe the same on every carrier
    (TLS may terminate at an intermediary such as a CDN, so URLs and
@@ -198,19 +208,21 @@ Any conforming carrier MUST:
    - An envelope over the hard ceiling MUST cause the receiver to
      close the carrier session without decoding it and without
      sending an `RError`.
-   - Once `RVersion` has fixed a lower `max_envelope_size`, a receiver
-     SHOULD enforce that value too. Such an envelope is within the
-     hard ceiling, so a hub MAY read it to learn its tag, and answers
-     a T-message with `RError(code=ENVELOPE_TOO_LARGE)` on that tag.
-     Any other envelope over the negotiated value closes the carrier
-     session.
+   - Once `RVersion` has fixed a lower `max_envelope_size` (see
+     "Version negotiation"), a receiver SHOULD enforce that value too,
+     and a receiver that does MUST NOT act on an envelope over it.
+     Such an envelope is within the hard ceiling, so a hub MAY read
+     it. If the hub reads it and it is a T-message, the hub answers
+     `RError(code=ENVELOPE_TOO_LARGE)` on that tag without performing
+     the request. In every other case the receiver MUST close the
+     carrier session. Either outcome is conforming; any other is not.
    - A carrier MUST hold its per-session buffering to a fixed bound.
      Until `THello` has completed, it MUST NOT buffer more than one
      envelope ceiling (1 MiB) of unprocessed input for the session. A
      receiver MAY enforce a ceiling lower than 1 MiB before
      authentication.
 4. **Treat carrier loss as session loss.** When the carrier session
-   ends, the session ends with it. No carrier may replay envelopes
+   ends, the session ends with it. A carrier MUST NOT replay envelopes
    across sessions or resume a session at the carrier layer. Recovery
    is the existing path only: a new session (optionally presenting
    `THello.resume_token`) followed by the canonical reconnect recipe
@@ -232,19 +244,25 @@ Any conforming carrier MUST:
    session.** Identity and authority come only from in-band envelopes:
    `TVersion`/`THello`, including device proof-of-possession
    (`THello.device_key_signature`), or, for a device being paired, its
-   `TPair(CLAIM)`. A carrier MUST NOT authenticate a session, resolve
-   an account or device, or accept any credential in place of
-   `THello`. After `THello`, the carrier MUST guarantee that every
-   envelope delivered into the session came from the peer that
-   completed `THello`, at least as strongly as the continuity of one
-   TLS connection guarantees it on the WSS binding. A carrier whose
-   session spans more than one transport connection or request
-   therefore needs a **carrier session credential**. That credential
-   is high-entropy; issued by the hub after `RHello`; carried only in
-   a request header, never in a URL or query string; valid for exactly
-   one session and void when that session ends; and never logged. A
-   request with a missing, unknown, expired or mismatched credential
-   is rejected without affecting any session.
+   `TPair(CLAIM)`, which authorizes nothing beyond waiting for that
+   pair session's `DPairResult` and never makes the session Ready. A
+   carrier MUST NOT authenticate a session, resolve an account or
+   device, or accept any credential in place of `THello`. From the
+   first envelope of a session, the carrier MUST guarantee that every
+   envelope delivered into the session came from the same peer, and
+   that the session's responses and pushes reach only that peer, at
+   least as strongly as the continuity of one WebSocket connection
+   guarantees it on the WSS binding. The peer that completes `THello`
+   (or, on a pairing session, `TPair(CLAIM)`) is therefore the peer
+   that sent `TVersion`. A carrier whose session spans more than one
+   transport connection or request therefore needs a **carrier session
+   credential**. That credential is high-entropy; issued by the hub
+   when the carrier session is established, before any envelope is
+   accepted on it; carried only in a request header, never in a URL or
+   query string; valid for exactly one session and void when that
+   session ends; and never logged. A request with a missing, unknown,
+   expired or mismatched credential is rejected without affecting any
+   session.
 
 ### Stream framing
 
@@ -266,9 +284,11 @@ this standard.
   the carrier session without reading the body. A `len32` within
   1 MiB but greater than a lower `max_envelope_size` fixed by
   `RVersion` is handled as rule 3 says.
-- A `len32` of 0 is malformed (the `MALFORMED_ENVELOPE` case). The
-  frame carries no envelope and therefore no tag to answer on, so the
-  receiver MUST close the carrier session.
+- A `len32` of 0 is malformed (the condition the `MALFORMED_ENVELOPE`
+  error code names, here without an `RError`). The frame carries no
+  envelope and therefore no tag to answer on, so the receiver MUST
+  close the carrier session without answering it, even though an
+  empty byte string would decode as an `Envelope` with no fields set.
 - A frame MUST contain exactly one envelope. Frames MUST NOT be split
   or merged: one frame, one envelope.
 
@@ -281,16 +301,20 @@ WebTransport stream) has one definition to follow.
 
 The canonical v1 carrier: WebSocket (RFC 6455) over TLS.
 
-- **Channel:** WebSocket over TLS. TLS is terminated at Cloudflare;
-  the origin uses Cloudflare Origin Certificates.
+- **Channel:** WebSocket over TLS. TLS is terminated at the hub's
+  edge: the CDN in front of the public hub, or the hub or its reverse
+  proxy when self-hosted.
 - **Endpoint:** `wss://ws.quickring.me/v1`. The path names the major
   version of the binding. Self-hosted hubs serve the same path on
   their own host.
-- **Credentials:** a credential or an envelope field MUST NOT appear
-  in the URL, the query string, `Sec-WebSocket-Protocol` or any other
-  upgrade header (rule 2). `Sec-WebSocket-Protocol` carries only
-  binding identifiers. Authentication happens in-band, in `THello`
-  (rule 7).
+- **Credentials:** credentials carried in envelopes, and envelope
+  fields of any kind, MUST NOT appear in the URL, the query string,
+  `Sec-WebSocket-Protocol` or any other upgrade header (rule 2).
+  `Sec-WebSocket-Protocol` carries only binding identifiers. The only
+  credential permitted in a request header is a carrier session
+  credential under rule 7, and the WSS binding has none, because one
+  WebSocket connection is one carrier session.
+  Authentication happens in-band, in `THello` (rule 7).
 - **Carrier session:** one WebSocket connection. Over RFC 8441 or
   RFC 9220 that WebSocket is carried on one HTTP stream. The session
   is scoped to the WebSocket connection, not to the underlying TCP or
@@ -300,7 +324,10 @@ The canonical v1 carrier: WebSocket (RFC 6455) over TLS.
   **binary** message. No envelope spans two messages, and no message
   carries two envelopes. A text message is a protocol violation. A
   hub MUST close the session on receiving one, in any session state,
-  without answering it; the close code is not specified.
+  without answering it; the close code is not specified. A
+  zero-length binary message is malformed in the same way as a
+  `len32` of 0 (see "Stream framing"): it carries no envelope, so the
+  hub MUST close the session without answering it.
 - **Envelope ceiling:** from the moment the upgrade completes, before
   any `THello`, a receiver MUST bound every WebSocket frame and every
   reassembled message at 1 MiB before buffering it, and MUST close the
@@ -514,6 +541,14 @@ Where the server is said to close the session, it ends the session by
 closing its carrier session. Where comments in the schema say
 "connection", they mean the session.
 
+**Establishment deadline.** This governs the states before Ready.
+Within 10 seconds of a carrier session being established (on the WSS
+binding, from the moment the upgrade completes), the hub MUST either
+have sent `RHello` on it or have placed it in pairing wait (a new
+device that has received `RPairClaimed`; see "Device pairing").
+Otherwise the hub MUST close it, regardless of any traffic on it.
+Pairing wait has its own timeout, the pair session's expiry.
+
 ### 1. Version negotiation
 
 The **first message** in every session, in both directions, is a
@@ -556,6 +591,12 @@ message RVersion {
   string server_version = 4;
 }
 ```
+
+A `TVersion.max_envelope_size` of 0 means the client states no
+preference, and the negotiated value is then the server's limit. The
+negotiated `max_envelope_size` applies to envelopes in both
+directions. This supersedes "Informational" in the `TVersion` comment
+for the purposes of rule 3 of the carrier contract.
 
 If the server cannot agree on a version (the client offered a
 version the server does not implement), the server responds with
@@ -698,13 +739,6 @@ After `RHello`, the session is ready for normal traffic. The
 client may now issue subscribes, publishes, catch-ups, and pairing
 requests. The server may now push `DDeliver` and `DPresence`.
 
-**Establishment deadline.** Within 10 seconds of a carrier session
-being established, the hub MUST either have sent `RHello` on it or
-have placed it in pairing wait (a new device that has received
-`RPairClaimed`; see "Device pairing"). Otherwise the hub MUST close
-it, regardless of any traffic on it. Pairing wait has its own
-timeout, the pair session's expiry.
-
 ### Heartbeats
 
 ```protobuf
@@ -722,7 +756,7 @@ message RPing {
 Clients send `TPing` every 30 seconds while idle. The server uses
 the heartbeat to refresh the device's presence TTL in Redis. A
 session that receives no envelope (pings included) for 90 seconds is
-considered abandoned, and the server closes it. Only an envelope
+considered abandoned, and the server MUST close it. Only an envelope
 resets this idle timer. Carrier frames (WebSocket Ping/Pong, TCP
 keepalive) MUST NOT reset it and MUST NOT refresh presence. A client
 MUST NOT rely on them to keep a session open; `TPing` is the only
@@ -732,17 +766,34 @@ keepalive this protocol defines.
 MUST re-validate the session's registration against current state
 (has this device's registration been replaced or removed? has the
 account owner revoked it?) at least once every 30 seconds of session
-time, measured on the hub's own clock, whatever the client sends or
-does not send. A `TPing` also triggers the check before it is
-answered. If the registration no longer checks out, the hub closes
-the session, answering neither `RPing` nor `RError`: any outstanding
-tag simply never resolves, and the client is expected to treat a
-closed session the same way it treats any other drop. This bounds a
-revoked-but-live session to one 30-second re-validation interval
-even when **no revocation message reaches the device** and the
-client sends nothing, which is why it exists independently of, not instead of,
-`DSessionRevoked` below: the two together are an immediate path and a
-bounded fallback, not two implementations of the same thing.
+time, whatever the client sends or does not send. Session time is
+wall-clock time on the hub's own clock; it does not depend on the
+client's clock or on any traffic. A `TPing` also triggers the check
+before it is answered.
+
+- If a check completes and the registration no longer checks out,
+  the hub MUST close the session, answering neither `RPing` nor
+  `RError`: any outstanding tag simply never resolves, and the client
+  is expected to treat a closed session the same way it treats any
+  other drop. The hub MAY push `DSessionRevoked` (a D-message on
+  `tag = 0`, not an answer to any T-message) immediately before
+  closing.
+- A check that cannot complete (for example, because the registration
+  store is unreachable) is not a pass. The hub MAY keep the session
+  open across such a check and retry, and MAY answer the `TPing` that
+  triggered it, but MUST close the session once 60 seconds of session
+  time have passed since the last check that completed and passed
+  (for a new session, since `RHello`).
+
+This bounds a revoked-but-live session to 30 seconds while the
+registration store is reachable, and to 60 seconds while checks cannot
+complete, even when **no revocation message reaches the device** and
+the client sends nothing. That is why it exists independently of, not
+instead of, `DSessionRevoked` below. The push is the immediate path
+and normally precedes any re-validation close; the re-validation
+close is the bounded fallback that does not depend on delivery. The
+two together are an immediate path and a bounded fallback, not two
+implementations of the same thing.
 
 ---
 
@@ -1005,7 +1056,10 @@ The server pushes `DSessionRevoked` to a device whose session has
 been administratively invalidated — its registration was replaced
 (a key rotation, e.g. device-0 recovery) or an account owner revoked
 it. Sent **immediately before** the server closes that device's
-session, so a client that receives it can tell a deliberate
+session, whether that close follows the revocation directly (the
+normal, immediate path) or follows a failed registration
+re-validation (the fallback under "Heartbeats", where the push is
+optional), so a client that receives it can tell a deliberate
 revocation apart from a transient network drop and respond
 accordingly (surface it to the user; do not silently reconnect with
 the same credentials).
@@ -1035,14 +1089,15 @@ A device is not guaranteed to receive this push — it may be offline
 at the moment of revocation, or the push itself may be dropped. The
 hub-clocked registration re-validation described under "Heartbeats"
 above is the bound for that case: at most one 30-second
-re-validation interval, whether or not the client sends anything,
+re-validation interval (60 seconds while checks cannot complete),
+whether or not the client sends anything,
 rather than an unbounded window. `DSessionRevoked` is the immediate
 path; the re-validation is the fallback that does not depend on
 delivery.
 
 See `dlockamy/vault: wiki/decisions/quickring-capability-model-fuchsia.md`
 §6.2 and `wiki/decisions/quickring-protocol-security-roadmap.md` §5 for
-why revocation needs both a push and a heartbeat-bounded fallback:
+why revocation needs both a push and a hub-clocked fallback:
 distributed revocation has no equivalent of a kernel-mediated handle
 close, so delivery of the push can never be assumed.
 
@@ -1888,7 +1943,7 @@ Initial v1 limits (subject to public-beta tuning):
 | TSubscribe | 50 active | Per session |
 | TSubscribe | 200 active | Per account |
 | Payload size | 64 KiB | Per TPublish (larger payloads go out-of-band via WebRTC or Bitchain, v1.5+) |
-| Carrier-session rate | 5/minute | Per account from new IPs |
+| Carrier-session rate | 5/minute | Per account from new IPs, counted at `THello`; admission before authentication is per source address (below) |
 | Pair sessions | 3 concurrent | Per account |
 | TRoster | not yet set | Per session and per account |
 
@@ -1896,7 +1951,10 @@ Every limit is scoped to a session or an account, never to a carrier
 artifact. The carrier-session-rate limit counts new **carrier
 sessions**: on the WSS binding, WebSocket upgrades that complete,
 including an RFC 8441 or RFC 9220 extended `CONNECT` that completes.
-It never counts individual HTTP requests on any carrier. The "new IP"
+It never counts individual HTTP requests on any carrier. The
+per-account count is applied at `THello`, when the session's account
+becomes known; before that, admission is limited per source address
+(below). The "new IP"
 it refers to is the source address the carrier session was
 established from, as seen by the hub's trusted edge. No limit is
 keyed on the source address of an individual request within a
@@ -2128,6 +2186,15 @@ session. Added the "Carriers" section (carrier contract, stream framing,
 WSS binding). On the WSS binding the `quickring.v1` subprotocol offer and
 echo are now normative: a change to the upgrade handshake, not to the
 envelope. Carrier keepalives no longer count toward liveness, and the hub
-re-validates a session's registration on its own clock. "Connection rate"
+re-validates a session's registration on its own clock, so a revoked
+session closes within 30 seconds, or 60 seconds while checks cannot
+complete. Carrier contract rule 7 binds every envelope of a session to
+one peer. A hub closes a carrier session that has not reached `RHello` or
+pairing wait within 10 seconds, and closes on a text message, a
+zero-length binary message or a `len32` of 0. On the WSS binding every
+frame and every reassembled message is bounded at 1 MiB from upgrade
+completion. A forwarded client address is taken only from a configured
+trusted proxy. A `TVersion.max_envelope_size` of 0 states no preference,
+and the negotiated value applies in both directions. "Connection rate"
 is renamed "Carrier-session rate". `TVersion` remains the only version
 authority.*
