@@ -4,7 +4,9 @@
 pub/sub, presence digest) is live in the hub (`quickring/hub`), Fabric Kit, and
 the v0 agent. Checked against the reference hub's source on 2026-10-27, it
 also implements pairing, offline catch-up, `DPresence`, publish dedup, rate
-limits (except the carrier-session rate, below), and roster read
+limits (with per-session publish limits of 60/sec and 6000/hour rather
+than the table's 10/sec and 600/hour, and except the carrier-session
+rate, below), and roster read
 (`TRoster`). `TUnsubscribe` is defined in the schema
 but the reference hub has no handler for it: it answers with
 `RError(UNKNOWN_MESSAGE_TYPE)`. E2E: the hub relays payloads as
@@ -22,20 +24,27 @@ not echo the `quickring.v1` subprotocol; resets its idle timer on
 WebSocket Ping/Pong frames; re-validates a session's registration only
 when a `TPing` arrives, not on its own clock, and treats a re-validation
 check that errors as passed, with no time limit; does not enforce a
-negotiated `max_envelope_size` lower than 1 MiB; does not limit
-carrier-session establishment or unauthenticated sessions per source
-address; has no 10-second establishment deadline (only the 90-second
-idle timer); does not close the session on a zero-length binary
-message; and closes on an oversized message without close code 1009.
+negotiated `max_envelope_size` lower than 1 MiB; fixes any lower
+`max_envelope_size` a client offers, with no 128 KiB floor, and caps
+an `RCatchUp` batch by entry count (500) rather than by the negotiated
+value; does not limit carrier-session establishment or unauthenticated
+sessions per source address; has no 10-second establishment deadline
+(only the 90-second idle timer); does not close the session on a
+zero-length binary message; closes on an oversized message without
+close code 1009 and, before `THello`, can hold a fragmented message
+plus its next frame, up to about 2 MiB, because its WebSocket library
+checks a message's size only after reading the whole frame; and never
+re-validates a session whose `THello`-time registration lookup failed.
 Fabric Kit does not offer `quickring.v1`, does not fail an upgrade
 response that names a subprotocol it did not offer, sends
 `TVersion.max_envelope_size` as 0 and does not enforce a negotiated
-ceiling, and does not bound received messages at the 1 MiB ceiling
-before buffering them (its WebSocket library's defaults allow far
-more).
-Interoperability is unaffected in the meantime, because absence of a
-subprotocol is tolerated in both directions and `TVersion` does all
-version work.
+ceiling, ignores a text message or a zero-length binary message
+instead of closing the session, and does not bound received messages
+at the 1 MiB ceiling before buffering them (its WebSocket library's
+defaults allow far more).
+Interoperability is unaffected by the subprotocol gaps in the
+meantime, because absence of a subprotocol is tolerated in both
+directions and `TVersion` does all version work.
 **Audience:** Quickring hub developers, SDK developers, third-party
 integrators.
 **Scope:** The full Quickring wire standard — both the **base layer** (the
@@ -199,7 +208,7 @@ Any conforming carrier MUST:
    that a topic is never URL-decoded or path-normalized, which would
    break the E2E associated data (`encryption.md` §6.3).
 3. **Enforce the envelope ceiling before buffering.** The receiver
-   checks `max_envelope_size` (hard ceiling 1 MiB) against the length
+   checks the hard ceiling (1 MiB) against the length
    of the **envelope bytes** before allocating or reading them, and it
    does so before authentication as well as after. Carrier encoding
    overhead (length prefixes, base64) does not count toward the
@@ -212,10 +221,11 @@ Any conforming carrier MUST:
      "Version negotiation"), a receiver SHOULD enforce that value too,
      and a receiver that does MUST NOT act on an envelope over it.
      Such an envelope is within the hard ceiling, so a hub MAY read
-     it. If the hub reads it and it is a T-message, the hub answers
+     it. If the hub reads it and it is a T-message, the hub MAY answer
      `RError(code=ENVELOPE_TOO_LARGE)` on that tag without performing
-     the request. In every other case the receiver MUST close the
-     carrier session. Either outcome is conforming; any other is not.
+     the request; in every other case the receiver MUST close the
+     carrier session. For a receiver that enforces the negotiated
+     value, these are the only conforming outcomes.
    - A carrier MUST hold its per-session buffering to a fixed bound.
      Until `THello` has completed, it MUST NOT buffer more than one
      envelope ceiling (1 MiB) of unprocessed input for the session. A
@@ -255,7 +265,7 @@ Any conforming carrier MUST:
    guarantees it on the WSS binding. The peer that completes `THello`
    (or, on a pairing session, `TPair(CLAIM)`) is therefore the peer
    that sent `TVersion`. A carrier whose session spans more than one
-   transport connection or request therefore needs a **carrier session
+   transport connection or request needs a **carrier session
    credential**. That credential is high-entropy; issued by the hub
    when the carrier session is established, before any envelope is
    accepted on it; carried only in a request header, never in a URL or
@@ -311,7 +321,7 @@ The canonical v1 carrier: WebSocket (RFC 6455) over TLS.
   fields of any kind, MUST NOT appear in the URL, the query string,
   `Sec-WebSocket-Protocol` or any other upgrade header (rule 2).
   `Sec-WebSocket-Protocol` carries only binding identifiers. The only
-  credential permitted in a request header is a carrier session
+  hub credential permitted in a request header is a carrier session
   credential under rule 7, and the WSS binding has none, because one
   WebSocket connection is one carrier session.
   Authentication happens in-band, in `THello` (rule 7).
@@ -323,18 +333,21 @@ The canonical v1 carrier: WebSocket (RFC 6455) over TLS.
 - **Framing:** one protobuf-encoded `Envelope` per WebSocket
   **binary** message. No envelope spans two messages, and no message
   carries two envelopes. A text message is a protocol violation. A
-  hub MUST close the session on receiving one, in any session state,
-  without answering it; the close code is not specified. A
+  receiver MUST close the session on receiving one, in any session
+  state, without answering it; the close code is not specified. A
   zero-length binary message is malformed in the same way as a
   `len32` of 0 (see "Stream framing"): it carries no envelope, so the
-  hub MUST close the session without answering it.
+  receiver MUST close the session without answering it.
 - **Envelope ceiling:** from the moment the upgrade completes, before
   any `THello`, a receiver MUST bound every WebSocket frame and every
-  reassembled message at 1 MiB before buffering it, and MUST close the
-  session when either bound is exceeded (rule 3). It SHOULD close with
-  close code 1009 (Message Too Big). Bounding only the reassembled
-  message is not enough, because one oversized frame is buffered
-  before reassembly starts.
+  reassembled message at 1 MiB before buffering it. The bound on a
+  frame includes the payload already buffered for the fragmented
+  message it continues: a frame whose declared length, added to that
+  payload, exceeds 1 MiB MUST be refused before its payload is read.
+  The receiver MUST close the session when a bound is exceeded
+  (rule 3) and SHOULD close with close code 1009 (Message Too Big).
+  Bounding only the reassembled message is not enough, because one
+  oversized frame is buffered before reassembly starts.
 - **Liveness:** liveness is in-band (`TPing`/`RPing`, see
   "Heartbeats"). WebSocket Ping/Pong control frames carry no protocol
   meaning. Either end answers them as RFC 6455 requires, but they do
@@ -547,7 +560,8 @@ binding, from the moment the upgrade completes), the hub MUST either
 have sent `RHello` on it or have placed it in pairing wait (a new
 device that has received `RPairClaimed`; see "Device pairing").
 Otherwise the hub MUST close it, regardless of any traffic on it.
-Pairing wait has its own timeout, the pair session's expiry.
+Pairing wait has its own timeout, the pair session's expiry. The hub
+SHOULD close the carrier session once it has delivered `DPairResult`.
 
 ### 1. Version negotiation
 
@@ -593,10 +607,16 @@ message RVersion {
 ```
 
 A `TVersion.max_envelope_size` of 0 means the client states no
-preference, and the negotiated value is then the server's limit. The
-negotiated `max_envelope_size` applies to envelopes in both
-directions. This supersedes "Informational" in the `TVersion` comment
-for the purposes of rule 3 of the carrier contract.
+preference, and the negotiated value is then the server's limit.
+Otherwise the negotiated value is the smaller of the client's value
+and the server's limit, but a server MUST NOT fix an
+`RVersion.max_envelope_size` below 128 KiB, so that every envelope
+carrying a payload at the 64 KiB limit (see "Rate limits and abuse")
+fits. The negotiated `max_envelope_size` applies to envelopes in both
+directions, and a sender MUST NOT send an envelope larger than it; a
+server splits a catch-up across `RCatchUp` batches (`has_more`) to
+stay within it. This supersedes "Informational" in the `TVersion`
+comment for the purposes of rule 3 of the carrier contract.
 
 If the server cannot agree on a version (the client offered a
 version the server does not implement), the server responds with
@@ -769,7 +789,8 @@ account owner revoked it?) at least once every 30 seconds of session
 time, whatever the client sends or does not send. Session time is
 wall-clock time on the hub's own clock; it does not depend on the
 client's clock or on any traffic. A `TPing` also triggers the check
-before it is answered.
+before it is answered. A hub MAY satisfy a `TPing`-triggered check
+with one that completed and passed within the previous 5 seconds.
 
 - If a check completes and the registration no longer checks out,
   the hub MUST close the session, answering neither `RPing` nor
@@ -785,10 +806,11 @@ before it is answered.
   time have passed since the last check that completed and passed
   (for a new session, since `RHello`).
 
-This bounds a revoked-but-live session to 30 seconds while the
-registration store is reachable, and to 60 seconds while checks cannot
-complete, even when **no revocation message reaches the device** and
-the client sends nothing. That is why it exists independently of, not
+This bounds a revoked-but-live session to 30 seconds plus the time one
+check takes to complete while the registration store is reachable, and
+to 60 seconds while checks cannot complete, even when **no revocation
+message reaches the device** and the client sends nothing. That is why
+it exists independently of, not
 instead of, `DSessionRevoked` below. The push is the immediate path
 and normally precedes any re-validation close; the re-validation
 close is the bounded fallback that does not depend on delivery. The
@@ -1057,12 +1079,14 @@ been administratively invalidated — its registration was replaced
 (a key rotation, e.g. device-0 recovery) or an account owner revoked
 it. Sent **immediately before** the server closes that device's
 session, whether that close follows the revocation directly (the
-normal, immediate path) or follows a failed registration
-re-validation (the fallback under "Heartbeats", where the push is
-optional), so a client that receives it can tell a deliberate
-revocation apart from a transient network drop and respond
-accordingly (surface it to the user; do not silently reconnect with
-the same credentials).
+normal, immediate path) or follows a re-validation check that
+completed and found the registration no longer valid (the fallback
+under "Heartbeats", where the push is optional), so a client that
+receives it can tell a deliberate revocation apart from a transient
+network drop and respond accordingly (surface it to the user; do not
+silently reconnect with the same credentials). A hub MUST NOT send it
+when it closes a session only because re-validation checks could not
+complete.
 
 ```protobuf
 message DSessionRevoked {
@@ -1089,7 +1113,8 @@ A device is not guaranteed to receive this push — it may be offline
 at the moment of revocation, or the push itself may be dropped. The
 hub-clocked registration re-validation described under "Heartbeats"
 above is the bound for that case: at most one 30-second
-re-validation interval (60 seconds while checks cannot complete),
+re-validation interval plus the time one check takes (60 seconds
+while checks cannot complete),
 whether or not the client sends anything,
 rather than an unbounded window. `DSessionRevoked` is the immediate
 path; the re-validation is the fallback that does not depend on
@@ -2187,14 +2212,16 @@ WSS binding). On the WSS binding the `quickring.v1` subprotocol offer and
 echo are now normative: a change to the upgrade handshake, not to the
 envelope. Carrier keepalives no longer count toward liveness, and the hub
 re-validates a session's registration on its own clock, so a revoked
-session closes within 30 seconds, or 60 seconds while checks cannot
-complete. Carrier contract rule 7 binds every envelope of a session to
-one peer. A hub closes a carrier session that has not reached `RHello` or
-pairing wait within 10 seconds, and closes on a text message, a
-zero-length binary message or a `len32` of 0. On the WSS binding every
-frame and every reassembled message is bounded at 1 MiB from upgrade
-completion. A forwarded client address is taken only from a configured
-trusted proxy. A `TVersion.max_envelope_size` of 0 states no preference,
-and the negotiated value applies in both directions. "Connection rate"
-is renamed "Carrier-session rate". `TVersion` remains the only version
+session closes within 30 seconds plus the time one check takes to
+complete, or 60 seconds while checks cannot complete. Carrier contract
+rule 7 binds every envelope of a session to one peer. A hub closes a
+carrier session that has not reached `RHello` or pairing wait within
+10 seconds. A receiver closes the session on a text message or a
+zero-length binary message, and a stream carrier closes on a `len32`
+of 0. On the WSS binding every frame and every reassembled message is
+bounded at 1 MiB from upgrade completion. A forwarded client address is
+taken only from a configured trusted proxy. A
+`TVersion.max_envelope_size` of 0 states no preference, a server never
+fixes a negotiated value below 128 KiB, and the negotiated value applies
+in both directions. "Connection rate" is renamed "Carrier-session rate". `TVersion` remains the only version
 authority.*
