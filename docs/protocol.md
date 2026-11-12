@@ -17,7 +17,8 @@ integrators.
 **Scope:** The full Quickring wire standard — both the **base layer** (the
 envelope, tags, the T/R/D grammar, errors, addressing) and the **fabric layer**
 (sessions, networked pub/sub, pairing, presence, offline catch-up, E2E) — spoken
-between Quickring agents and the Quickring hub over WebSocket. The canonical
+between Quickring agents and the Quickring hub over a conforming carrier
+(in v1, WebSocket over TLS; see "Carriers"). The canonical
 schema is [`../proto/quickring/v1/quickring.proto`](../proto/quickring/v1/quickring.proto);
 this document is normative for semantics. See "Protocol layering" for who
 *implements* each layer.
@@ -100,21 +101,161 @@ Quickring is two services, not one. Don't conflate them:
   (a read task + a write task per connection sharing the WebSocket
   via `SplitSink` / `SplitStream`).
 
-- **Channel:** WebSocket. TLS terminated at Cloudflare; origin uses
-  Cloudflare Origin Certificates.
-- **Endpoint:** `wss://ws.quickring.me/v1`
-- **Subprotocol:** `quickring.v1` (negotiated in the WebSocket
-  handshake; future protocol versions get new subprotocol strings).
-- **Framing:** One protobuf-encoded `Envelope` per WebSocket binary
-  frame. No multi-frame messages in v1.
-- **Max message size:** 1 MiB. Larger payloads (file transfer) are
-  handled out-of-band via WebRTC or Bitchain in v1.5+ and never
-  traverse the hub.
+- **Carrier:** how envelopes travel between a client and the hub is
+  specified once, in "Carriers" below. The channel, endpoint,
+  subprotocol and framing for v1 are in its "WSS binding" subsection.
+  Nothing else in this document depends on which carrier is in use.
+- **Max envelope size:** 1 MiB, on every carrier. Larger payloads
+  (file transfer) are handled out-of-band via WebRTC or Bitchain in
+  v1.5+ and never traverse the hub.
 - **Timestamps:** All timestamps on the wire are unix milliseconds,
   UTC. No exceptions, no local time, no timezone offsets. In Go this
   is `time.Now().UTC().UnixMilli()`; in Dart, `DateTime.now()
   .toUtc().millisecondsSinceEpoch`. Display-local conversion happens
   only at the UI edge, never on the wire.
+
+---
+
+## Carriers
+
+A **carrier** is the transport that moves envelopes between one client
+and one hub. A **session** (see "Session lifecycle") runs over exactly
+one **carrier session**: the span from the carrier being established
+to its loss or close. Everything this document says about sessions
+(tag tracking, version negotiation, authentication, heartbeats,
+subscriptions, rate limits) is scoped to the session, never to a
+carrier artifact such as a TCP connection, an HTTP request or a
+stream.
+
+The envelope, the T/R/D grammar, hub ordering, authentication and
+proof-of-possession, and end-to-end encryption are **carrier-
+independent**. A carrier is a property of the fabric client and the
+hub. On a device it sits behind the remote-transport-provider seam
+and is invisible to the local router and to message-kit.
+
+v1 defines one carrier, the **WSS binding** below. It is the only
+conforming v1 carrier for a public hub.
+
+### The carrier contract (normative)
+
+Any conforming carrier MUST:
+
+1. **Present each session with a reliable, ordered, bidirectional,
+   message-preserving stream of envelopes.** Retransmission inside
+   the carrier to achieve this is allowed and invisible to the
+   session. A carrier that can lose, duplicate or reorder envelopes in
+   either direction does not conform.
+2. **Carry envelope bytes verbatim and opaquely.** A carrier MUST NOT
+   lift any envelope field (topic, tag, message or device ids, payload
+   type) into carrier metadata: URLs, query strings, headers, event
+   names. This keeps what an intermediary can observe the same on
+   every carrier (TLS terminates at Cloudflare, so URLs and headers
+   are visible there and may be logged). It also guarantees that a
+   topic is never URL-decoded or path-normalized, which would break the
+   E2E associated data (`encryption.md` §6.3).
+3. **Enforce the envelope ceiling before buffering.** The receiver
+   checks `max_envelope_size` (hard ceiling 1 MiB) against the length
+   of the **envelope bytes** before allocating or reading them, and it
+   does so before authentication as well as after. Carrier encoding
+   overhead (length prefixes, base64) does not count toward the
+   envelope ceiling. It does count toward the carrier's own buffer
+   limits.
+4. **Treat carrier loss as session loss.** When the carrier session
+   ends, the session ends with it. No carrier may replay envelopes
+   across sessions or resume a session at the carrier layer. Recovery
+   is the existing path only: a new session presenting
+   `THello.resume_token`, then the canonical reconnect recipe
+   (`TSubscribe` then `TCatchUp`, see "Subscribe"). A carrier-level
+   resume (for example, from a last-received event id) would be a
+   second catch-up path, which this protocol forbids.
+5. **Leave version authority with `TVersion`.** A carrier's endpoint
+   path and any subprotocol or media-type identifier name the
+   **binding**. They never negotiate the protocol version. The in-band
+   `TVersion`/`RVersion` exchange is the only version authority on
+   every carrier.
+6. **Be selected by configuration or discovery, never by negotiation
+   inside the protocol.** No envelope variant, field or capability
+   flag announces, requests or switches a carrier.
+
+### Stream framing
+
+A carrier whose underlying transport is a byte stream (one with no
+message boundaries of its own) frames envelopes as follows, and every
+such carrier uses this same framing:
+
+```
+frame = len32 ‖ envelope_bytes
+```
+
+`len32` is a big-endian `uint32` giving the byte length of
+`envelope_bytes`, which is one protobuf-encoded `Envelope`. This
+matches the big-endian `len16` / `be64` convention used elsewhere in
+this standard. The receiver applies rule 3 to `len32` **before**
+reading the body. A receiver that reads a `len32` greater than the
+session's `max_envelope_size` (or greater than 1 MiB before
+`RVersion` has fixed it) MUST close the carrier session without
+reading the body. Frames are never split or merged: one frame, one
+envelope.
+
+The WSS binding does not use stream framing, because WebSocket
+messages already preserve boundaries. The framing exists so that any
+future stream carrier (an HTTP streaming body, a WebTransport stream)
+has one definition to follow.
+
+### WSS binding
+
+The canonical v1 carrier: WebSocket (RFC 6455) over TLS.
+
+- **Channel:** WebSocket over TLS. TLS is terminated at Cloudflare;
+  the origin uses Cloudflare Origin Certificates.
+- **Endpoint:** `wss://ws.quickring.me/v1`. The path names the major
+  version of the binding. Self-hosted hubs serve the same path on
+  their own host.
+- **Carrier session:** one WebSocket connection. On this binding a
+  session and a WebSocket connection have the same lifetime, which is
+  why earlier drafts of this document said "connection". The rules
+  are scoped to the session.
+- **Framing:** one protobuf-encoded `Envelope` per WebSocket
+  **binary** message. No envelope spans two messages, and no message
+  carries two envelopes. A text message is a protocol violation, and
+  the hub closes the session.
+- **Liveness:** liveness is in-band (`TPing`/`RPing`, see
+  "Heartbeats"). WebSocket Ping/Pong control frames carry no protocol
+  meaning. Either end answers them as RFC 6455 requires, but neither
+  presence nor revocation depends on them, and a client MUST NOT use
+  them in place of `TPing`.
+- **Subprotocol:** `quickring.v1`, the binding identifier for this
+  major version. It identifies the binding. It does not negotiate
+  the protocol version (rule 5).
+  - A client MUST offer `quickring.v1` in `Sec-WebSocket-Protocol`
+    on the upgrade request.
+  - A hub that serves `/v1` MUST echo `quickring.v1` in the upgrade
+    response when the client offered it. A hub MUST NOT echo a
+    subprotocol the client did not offer.
+  - A v1 hub MUST accept an upgrade that offers **no** subprotocol,
+    and completes it without a `Sec-WebSocket-Protocol` header.
+    Clients that predate this rule offer none. Absence stays
+    tolerated on `/v1` for the life of the v1 binding, including
+    the N/N+1 window of the next major version (see "Versioning").
+  - A client that offered `quickring.v1` and receives an upgrade
+    response with no subprotocol MAY continue, because the hub
+    may predate this rule. A client MUST fail the connection if the
+    response names a subprotocol it did not offer (RFC 6455 §4.1).
+  - Neither side branches protocol behaviour on the subprotocol.
+    `TVersion` remains authoritative. A hub that echoes
+    `quickring.v1` still answers an unsupported `TVersion` with
+    `RError(VERSION_INCOMPATIBLE)`.
+
+  > **Implementation status (2026-11-11):** the subprotocol rules above
+  > are newly normative. Neither reference implementation follows them
+  > yet: the reference hub does not echo a subprotocol, and Fabric
+  > Kit does not offer one. Interoperability is unaffected in the
+  > meantime, because absence is tolerated in both directions and
+  > `TVersion` already does all version work.
+- **Same carrier, no spec change:** WebSocket over HTTP/2 (RFC 8441)
+  or HTTP/3 (RFC 9220), and WSS tunnelled through an explicit HTTP
+  `CONNECT` proxy, are this same binding. They are usable wherever
+  the edge and the client support them.
 
 ---
 
@@ -228,9 +369,12 @@ to add new types in future versions without breaking older clients
   T-message in v1 carries a non-zero tag and expects a response.
 - Clients may allocate tags sequentially or randomly; the server
   does not interpret tag values, only echoes them.
-- The server tracks outstanding tags per connection. If a client
+- The server tracks outstanding tags per session. If a client
   sends a T-message with a tag that is already in flight, the server
-  responds with `RError(tag=duplicate_tag, code=TAG_IN_USE)`.
+  responds with `RError(tag=duplicate_tag, code=TAG_IN_USE)`. Tags
+  have no meaning across sessions: when a session ends, every
+  outstanding tag on it is abandoned unanswered, and a new session
+  starts with no tags in flight.
 
 **One T, one R.** Every T-message receives exactly one terminal
 response — either its matching R-message or an `RError` — carrying
@@ -255,16 +399,25 @@ implementation detail of the protocol layer.
 
 ## Session lifecycle
 
-A Quickring session is the lifetime of one authenticated WebSocket
-connection. Every session traverses these states in order:
+A Quickring session is the lifetime of one **carrier session** (see
+"Carriers"). On the WSS binding, that is one WebSocket connection.
+The session begins when the carrier session is established and ends
+when the carrier session is lost or closed, by either side, for any
+reason. A session never outlives its carrier session and never moves
+to another one. Continuity across sessions is provided only by
+`resume_token` and `TCatchUp`. Every session traverses these states
+in order:
 
 ```
-   (connected) ──> Version ──> Hello ──> Ready ──> (closed)
+   (carrier up) ──> Version ──> Hello ──> Ready ──> (carrier closed)
 ```
+
+Where this document says the server "closes the connection", it means
+the server ends the session by closing its carrier session.
 
 ### 1. Version negotiation
 
-The **first message** on every connection, in both directions, is a
+The **first message** in every session, in both directions, is a
 version negotiation. No other traffic is permitted until version is
 agreed.
 
@@ -442,7 +595,7 @@ the HTTP API and reconnect.
 
 ### 3. Ready
 
-After `RHello`, the connection is ready for normal traffic. The
+After `RHello`, the session is ready for normal traffic. The
 client may now issue subscribes, publishes, catch-ups, and pairing
 requests. The server may now push `DDeliver` and `DPresence`.
 
@@ -462,15 +615,18 @@ message RPing {
 
 Clients send `TPing` every 30 seconds while idle. The server uses
 the heartbeat to refresh the device's presence TTL in Redis. A
-connection with no traffic (including pings) for 90 seconds is
-considered abandoned and closed by the server.
+session with no traffic (including pings) for 90 seconds is
+considered abandoned, and the server closes it. Carrier-level
+keepalives (WebSocket Ping/Pong, TCP keepalive) never refresh
+presence. A client MUST NOT rely on them to keep a session open;
+`TPing` is the only keepalive this protocol defines.
 
-Every `TPing` also re-validates the connection's registration against
+Every `TPing` also re-validates the session's registration against
 current state (has this device's registration been replaced or
 removed? has the account owner revoked it?). If it no longer checks
-out, the server closes the connection instead of answering with
+out, the server closes the session instead of answering with
 `RPing` — no `RError` either, since the tag simply never resolves and
-the client is expected to treat a closed connection the same way it
+the client is expected to treat a closed session the same way it
 treats any other drop. This bounds a revoked-but-live session to at
 most one heartbeat interval (~30s) even with **no wire message at
 all**, which is why it exists independently of, not instead of,
@@ -1474,7 +1630,7 @@ A fully populated entry is ~320 bytes on the wire (36-byte device id
 devices is ~32 KB, against 64 KiB payload guidance and the 1 MiB
 envelope ceiling — **size is ruled out as a consideration.** The hub
 **SHOULD** cap the whole-roster form so `RRoster` stays inside the
-connection's negotiated `max_envelope_size`; **256 entries** is the
+session's negotiated `max_envelope_size`; **256 entries** is the
 recommended cap and is where `truncated` comes from.
 
 Backward behaviour needs no negotiation. A client speaking to a hub
@@ -1604,23 +1760,31 @@ code in v1, and 51–59 are reserved beside it.
 
 ## Rate limits and abuse
 
-v1 enforces per-connection and per-account limits. Hitting a limit
+v1 enforces per-session and per-account limits. Hitting a limit
 returns `RError(code=PUBLISH_RATE_LIMITED)` or
 `RError(code=SUBSCRIBE_RATE_LIMITED)`; suspicious patterns return
-`RError(code=ABUSE_DETECTED)` and close the connection.
+`RError(code=ABUSE_DETECTED)` and close the session.
 
 Initial v1 limits (subject to public-beta tuning):
 
 | Limit | Value | Scope |
 |---|---|---|
-| TPublish | 10/sec, 600/hour | Per connection |
+| TPublish | 10/sec, 600/hour | Per session |
 | TPublish | 50/sec, 6000/hour | Per account (all devices) |
-| TSubscribe | 50 active | Per connection |
+| TSubscribe | 50 active | Per session |
 | TSubscribe | 200 active | Per account |
 | Payload size | 64 KiB | Per TPublish (larger payloads go out-of-band via WebRTC or Bitchain, v1.5+) |
-| Connection rate | 5/minute | Per account from new IPs |
+| Session rate | 5/minute | Per account from new IPs |
 | Pair sessions | 3 concurrent | Per account |
-| TRoster | not yet set | Per connection and per account |
+| TRoster | not yet set | Per session and per account |
+
+Every limit is scoped to a session or an account, never to a carrier
+artifact. The session-rate limit counts new **carrier sessions**
+(on the WSS binding, WebSocket upgrades that complete). It never
+counts individual HTTP requests on any carrier. The "new IP" it
+refers to is the address the carrier session was established from.
+No limit is keyed on the source address of an individual request
+within a session.
 
 `ROSTER_RATE_LIMITED` exists as a code so the limit can be turned on
 without a wire change; the **numbers** are a public-beta abuse-policy
@@ -1630,7 +1794,7 @@ expected, human-paced event, not a hot path — a limit tuned as though
 it were a hot path would break the normal flow.
 
 Abuse heuristics live server-side and look only at metadata
-(message frequency, recipient graph, connection patterns). The hub
+(message frequency, recipient graph, session patterns). The hub
 **does not** inspect payload contents, in keeping with the E2E
 stance. See `agents/projects/quickring.md` for the locked rationale.
 
@@ -1638,12 +1802,18 @@ stance. See `agents/projects/quickring.md` for the locked rationale.
 
 ## Versioning
 
-- Major version is part of the subprotocol string
-  (`quickring.v1`, `quickring.v2`, etc.) and the WebSocket
-  endpoint path (`/v1`, `/v2`).
+- Major version is part of the `TVersion` string (`quickring.v1`,
+  `quickring.v2`, etc.), which is the only version authority. It is
+  mirrored in each carrier binding's identifiers: on the WSS binding,
+  the subprotocol string and the endpoint path (`/v1`, `/v2`). These
+  name the binding. They do not negotiate (see "Carriers").
 - Within a major version, the protocol is backward-compatible.
   New message types are additive; new fields on existing messages
   must be optional.
+- A new carrier binding is additive. It gets new endpoint paths
+  under the same major version, carries the same envelope, and
+  negotiates with the same `TVersion`. It changes no envelope byte
+  and needs no major bump.
 - Breaking changes require a major version bump. The hub supports
   the previous major version for at least **90 days** after a new
   major version goes live, to give SDKs and third-party agents
@@ -1703,6 +1873,24 @@ do not appear in this version of the protocol.
   residual (see "Roster read"). Forcing a directory to *prove*
   freshness is the key-transparency problem and is not attempted
   here.
+- **An HTTP streaming carrier.** A second carrier for clients on
+  networks that refuse the WebSocket upgrade but pass streamed HTTPS:
+  one long-lived streaming `GET` downstream and upstream `POST`s, both
+  using stream framing (see "Carriers"). Long-poll is its polling
+  mode, not a separate design. It is named here so nobody invents it
+  differently, and it is **deliberately not built or specified in
+  v1**. It would need no envelope change and no change to hub
+  ordering, authentication or E2E, but it does need carrier-level
+  rules that v1 does not define: strict upstream ordering across
+  `POST`s, downstream acknowledgement in polling mode, and a carrier
+  session credential binding each `POST` to its session, which
+  requires a security review before any build. **Build trigger:** a
+  measured population of failed `/v1` upgrades in hub and Cloudflare
+  telemetry that persists *after* client support for HTTP `CONNECT`
+  proxies has shipped. Until then the WSS binding is the only
+  conforming carrier. Mapping Hearth semantics onto REST resources
+  (topics in URLs, delivery by webhook) is a different thing and is
+  rejected outright: it would be a second wire contract.
 - **Teams / multi-account topics** (`v2.5`). The `team/` topic
   prefix is reserved but unused.
 - **Federation** (`v3+`). v1 is hub-anchored. No `@user@otherhub`
@@ -1767,8 +1955,8 @@ Captured for resolution before v0 implementation begins.
    draft: no, keep the protocol simple; receipts are an
    application-layer concern.
 2. **Should `subscription_id`s be globally unique or
-   per-connection?** Current draft: per-connection (server-assigned
-   strings, opaque to client, scope = this connection).
+   per-session?** Current draft: per-session (server-assigned
+   strings, opaque to client, scope = this session).
 3. **Heartbeat cadence** — 30 seconds chosen somewhat arbitrarily.
    Should be load-tested before public beta to balance presence
    accuracy against hub CPU cost.
@@ -1808,4 +1996,10 @@ Messaging Architect agent. Developer review pass complete; the canonical
 `.proto` is published at `../proto/quickring/v1/quickring.proto` and the v0
 subset is implemented end to end (hub QR-3..6, Fabric Kit QR-7, agent
 QR-8/9 — epic QR-1 closed). Ownership reframed per ADR-0002: this standard
-owns both layers; message-kit and Fabric Kit are conforming implementations.*
+owns both layers; message-kit and Fabric Kit are conforming implementations.
+2026-11-11: made carrier-neutral (no wire change). A session is now defined
+per carrier session, not per WebSocket connection. Added the "Carriers"
+section (carrier contract, stream framing, WSS binding). The `quickring.v1`
+subprotocol is now normative (client offers, hub echoes, absence tolerated,
+`TVersion` authoritative). The HTTP streaming carrier is named under "What's
+deliberately not in v1".*
