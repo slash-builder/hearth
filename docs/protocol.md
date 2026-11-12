@@ -12,6 +12,21 @@ client SDK (Fabric Kit); per-level status and its limits are in
 [`encryption.md`](encryption.md) §1.2 and the README's "Encryption:
 implementation status". Per-resource keys (E2) and later levels are
 spec-only. Canonical schema: [`../proto/quickring/v1/quickring.proto`](../proto/quickring/v1/quickring.proto).
+Rules added on 2026-11-11 that the reference implementations do not yet
+follow (checked against their source that day): the reference hub does
+not echo the `quickring.v1` subprotocol; resets its idle timer on
+WebSocket Ping/Pong frames; re-validates a session's registration only
+when a `TPing` arrives, not on its own clock; does not enforce a
+negotiated `max_envelope_size` lower than 1 MiB; has no
+carrier-session-rate limit; has no 10-second establishment deadline
+(only the 90-second idle timer); and closes on an oversized message
+without close code 1009. Fabric Kit does not offer `quickring.v1`, does
+not fail an upgrade response that names a subprotocol it did not offer,
+and does not bound received messages at the 1 MiB ceiling before
+buffering them (its WebSocket library's defaults allow far more).
+Interoperability is unaffected in the meantime, because absence of a
+subprotocol is tolerated in both directions and `TVersion` does all
+version work.
 **Audience:** Quickring hub developers, SDK developers, third-party
 integrators.
 **Scope:** The full Quickring wire standard — both the **base layer** (the
@@ -22,6 +37,12 @@ between Quickring agents and the Quickring hub over a conforming carrier
 schema is [`../proto/quickring/v1/quickring.proto`](../proto/quickring/v1/quickring.proto);
 this document is normative for semantics. See "Protocol layering" for who
 *implements* each layer.
+
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+"SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and
+"OPTIONAL" in this document are to be interpreted as described in
+BCP 14 (RFC 2119, RFC 8174) when, and only when, they appear in all
+capitals, as shown here.
 
 ---
 
@@ -40,7 +61,8 @@ The canonical Envelope is defined in this standard's `.proto`
 **not** imported from elsewhere. DeviceNix message-kit is a *conforming
 implementation* that adopts the Quickring envelope as its canonical on-device bus
 format: a message is one Quickring envelope end to end, and crossing the box
-boundary only swaps the *transport* (`AF_UNIX` socket ↔ WebSocket). The Quickring
+boundary only swaps the *transport* (`AF_UNIX` socket ↔ the hub carrier,
+WebSocket in v1). The Quickring
 daemon registers with the message-kit router as the **remote-transport provider**.
 
 > **Note (ADR-0002, 2026-06-05):** earlier drafts said the envelope was owned by
@@ -67,7 +89,8 @@ binary format), but in *discipline*:
   a step enum, the 9P `Twalk` pattern) or application-layer
   payloads, not new variants.
 - Every client request is paired with exactly one server response,
-  correlated by a per-message **tag**.
+  correlated by a per-message **tag**, for as long as its session
+  lasts.
 - Server-pushed messages (deliveries, presence updates) are a
   separate, visibly-distinct category.
 - Multi-step interactions use server-issued session handles instead
@@ -93,8 +116,8 @@ Quickring is two services, not one. Don't conflate them:
   Lockamy Studios language convention locked 2026-05-30 (pivoted from
   Go + Gin); consumes Service Kit (LS-41) for scaffolding. This
   document does **not** cover the HTTP API.
-- **`ws.quickring.me`** — the hub: the long-lived WebSocket service
-  this document specifies. Implemented in Rust on top of `axum`'s
+- **`ws.quickring.me`** — the hub: the long-lived service this
+  document specifies, reached over the carrier in "Carriers". Implemented in Rust on top of `axum`'s
   WebSocket support (`axum::extract::ws`), which sits on `tokio` +
   `hyper` + `tokio-tungstenite`. The one-reader / one-writer concurrency
   model the hub needs maps directly onto tokio's async task pattern
@@ -104,7 +127,8 @@ Quickring is two services, not one. Don't conflate them:
 - **Carrier:** how envelopes travel between a client and the hub is
   specified once, in "Carriers" below. The channel, endpoint,
   subprotocol and framing for v1 are in its "WSS binding" subsection.
-  Nothing else in this document depends on which carrier is in use.
+  Apart from the WSS binding, this document does not depend on which
+  carrier is in use.
 - **Max envelope size:** 1 MiB, on every carrier. Larger payloads
   (file transfer) are handled out-of-band via WebRTC or Bitchain in
   v1.5+ and never traverse the hub.
@@ -127,14 +151,19 @@ subscriptions, rate limits) is scoped to the session, never to a
 carrier artifact such as a TCP connection, an HTTP request or a
 stream.
 
-The envelope, the T/R/D grammar, hub ordering, authentication and
-proof-of-possession, and end-to-end encryption are **carrier-
-independent**. A carrier is a property of the fabric client and the
-hub. On a device it sits behind the remote-transport-provider seam
-and is invisible to the local router and to message-kit.
+The envelope, the T/R/D grammar, the order in which the hub accepts
+and delivers messages, authentication and proof-of-possession, and
+end-to-end encryption are **carrier-independent**. A carrier is a
+property of the client's link to the hub. On a device it sits beneath
+the remote-transport provider (see "Protocol layering") and is
+invisible to the local router and to message-kit.
 
 v1 defines one carrier, the **WSS binding** below. It is the only
-conforming v1 carrier for a public hub.
+conforming v1 carrier for every hub: public, self-hosted or local. A
+new carrier becomes conforming only through a revision of this
+standard that specifies it in full against rules 1–7 of the carrier
+contract below. A carrier defined by an implementation is not
+conforming.
 
 ### The carrier contract (normative)
 
@@ -144,15 +173,21 @@ Any conforming carrier MUST:
    message-preserving stream of envelopes.** Retransmission inside
    the carrier to achieve this is allowed and invisible to the
    session. A carrier that can lose, duplicate or reorder envelopes in
-   either direction does not conform.
+   either direction does not conform. Reliability holds only for the
+   life of the carrier session: envelopes in flight when it ends may
+   be lost (rule 4). Recovery is a session-level matter: `TCatchUp`
+   recovers deliveries, and a retried `TPublish` with the same
+   `client_message_id` recovers a publish.
 2. **Carry envelope bytes verbatim and opaquely.** A carrier MUST NOT
    lift any envelope field (topic, tag, message or device ids, payload
-   type) into carrier metadata: URLs, query strings, headers, event
-   names. This keeps what an intermediary can observe the same on
-   every carrier (TLS terminates at Cloudflare, so URLs and headers
-   are visible there and may be logged). It also guarantees that a
-   topic is never URL-decoded or path-normalized, which would break the
-   E2E associated data (`encryption.md` §6.3).
+   type) or any credential, including `THello.bearer_token`,
+   `THello.device_key_signature` and `THello.resume_token`, into
+   carrier metadata: URLs, query strings, headers, event names. This
+   keeps what an intermediary can observe the same on every carrier
+   (TLS may terminate at an intermediary such as a CDN, so URLs and
+   headers are visible there and may be logged). It also guarantees
+   that a topic is never URL-decoded or path-normalized, which would
+   break the E2E associated data (`encryption.md` §6.3).
 3. **Enforce the envelope ceiling before buffering.** The receiver
    checks `max_envelope_size` (hard ceiling 1 MiB) against the length
    of the **envelope bytes** before allocating or reading them, and it
@@ -160,11 +195,25 @@ Any conforming carrier MUST:
    overhead (length prefixes, base64) does not count toward the
    envelope ceiling. It does count toward the carrier's own buffer
    limits.
+   - An envelope over the hard ceiling MUST cause the receiver to
+     close the carrier session without decoding it and without
+     sending an `RError`.
+   - Once `RVersion` has fixed a lower `max_envelope_size`, a receiver
+     SHOULD enforce that value too. Such an envelope is within the
+     hard ceiling, so a hub MAY read it to learn its tag, and answers
+     a T-message with `RError(code=ENVELOPE_TOO_LARGE)` on that tag.
+     Any other envelope over the negotiated value closes the carrier
+     session.
+   - A carrier MUST hold its per-session buffering to a fixed bound.
+     Until `THello` has completed, it MUST NOT buffer more than one
+     envelope ceiling (1 MiB) of unprocessed input for the session. A
+     receiver MAY enforce a ceiling lower than 1 MiB before
+     authentication.
 4. **Treat carrier loss as session loss.** When the carrier session
    ends, the session ends with it. No carrier may replay envelopes
    across sessions or resume a session at the carrier layer. Recovery
-   is the existing path only: a new session presenting
-   `THello.resume_token`, then the canonical reconnect recipe
+   is the existing path only: a new session (optionally presenting
+   `THello.resume_token`) followed by the canonical reconnect recipe
    (`TSubscribe` then `TCatchUp`, see "Subscribe"). A carrier-level
    resume (for example, from a last-received event id) would be a
    second catch-up path, which this protocol forbids.
@@ -175,13 +224,33 @@ Any conforming carrier MUST:
    every carrier.
 6. **Be selected by configuration or discovery, never by negotiation
    inside the protocol.** No envelope variant, field or capability
-   flag announces, requests or switches a carrier.
+   flag announces, requests or switches a carrier. Discovery results
+   are unauthenticated hints: they may choose among carriers and
+   endpoints the client is already configured to accept, but they
+   never add one and never relax TLS or authentication.
+7. **Bind every envelope to the peer that authenticated the
+   session.** Identity and authority come only from in-band envelopes:
+   `TVersion`/`THello`, including device proof-of-possession
+   (`THello.device_key_signature`), or, for a device being paired, its
+   `TPair(CLAIM)`. A carrier MUST NOT authenticate a session, resolve
+   an account or device, or accept any credential in place of
+   `THello`. After `THello`, the carrier MUST guarantee that every
+   envelope delivered into the session came from the peer that
+   completed `THello`, at least as strongly as the continuity of one
+   TLS connection guarantees it on the WSS binding. A carrier whose
+   session spans more than one transport connection or request
+   therefore needs a **carrier session credential**. That credential
+   is high-entropy; issued by the hub after `RHello`; carried only in
+   a request header, never in a URL or query string; valid for exactly
+   one session and void when that session ends; and never logged. A
+   request with a missing, unknown, expired or mismatched credential
+   is rejected without affecting any session.
 
 ### Stream framing
 
 A carrier whose underlying transport is a byte stream (one with no
-message boundaries of its own) frames envelopes as follows, and every
-such carrier uses this same framing:
+message boundaries of its own) MUST frame envelopes as follows, and
+every such carrier uses this same framing:
 
 ```
 frame = len32 ‖ envelope_bytes
@@ -190,17 +259,23 @@ frame = len32 ‖ envelope_bytes
 `len32` is a big-endian `uint32` giving the byte length of
 `envelope_bytes`, which is one protobuf-encoded `Envelope`. This
 matches the big-endian `len16` / `be64` convention used elsewhere in
-this standard. The receiver applies rule 3 to `len32` **before**
-reading the body. A receiver that reads a `len32` greater than the
-session's `max_envelope_size` (or greater than 1 MiB before
-`RVersion` has fixed it) MUST close the carrier session without
-reading the body. Frames are never split or merged: one frame, one
-envelope.
+this standard.
+
+- The receiver MUST apply rule 3 to `len32` **before** reading the
+  body. A `len32` greater than 1 MiB MUST cause the receiver to close
+  the carrier session without reading the body. A `len32` within
+  1 MiB but greater than a lower `max_envelope_size` fixed by
+  `RVersion` is handled as rule 3 says.
+- A `len32` of 0 is malformed (the `MALFORMED_ENVELOPE` case). The
+  frame carries no envelope and therefore no tag to answer on, so the
+  receiver MUST close the carrier session.
+- A frame MUST contain exactly one envelope. Frames MUST NOT be split
+  or merged: one frame, one envelope.
 
 The WSS binding does not use stream framing, because WebSocket
 messages already preserve boundaries. The framing exists so that any
-future stream carrier (an HTTP streaming body, a WebTransport stream)
-has one definition to follow.
+stream carrier this standard adds later (an HTTP streaming body, a
+WebTransport stream) has one definition to follow.
 
 ### WSS binding
 
@@ -211,51 +286,72 @@ The canonical v1 carrier: WebSocket (RFC 6455) over TLS.
 - **Endpoint:** `wss://ws.quickring.me/v1`. The path names the major
   version of the binding. Self-hosted hubs serve the same path on
   their own host.
-- **Carrier session:** one WebSocket connection. On this binding a
-  session and a WebSocket connection have the same lifetime, which is
-  why earlier drafts of this document said "connection". The rules
-  are scoped to the session.
+- **Credentials:** a credential or an envelope field MUST NOT appear
+  in the URL, the query string, `Sec-WebSocket-Protocol` or any other
+  upgrade header (rule 2). `Sec-WebSocket-Protocol` carries only
+  binding identifiers. Authentication happens in-band, in `THello`
+  (rule 7).
+- **Carrier session:** one WebSocket connection. Over RFC 8441 or
+  RFC 9220 that WebSocket is carried on one HTTP stream. The session
+  is scoped to the WebSocket connection, not to the underlying TCP or
+  QUIC connection. Where several WebSocket connections share one
+  underlying connection, their sessions MUST NOT share any state.
 - **Framing:** one protobuf-encoded `Envelope` per WebSocket
   **binary** message. No envelope spans two messages, and no message
-  carries two envelopes. A text message is a protocol violation, and
-  the hub closes the session.
+  carries two envelopes. A text message is a protocol violation. A
+  hub MUST close the session on receiving one, in any session state,
+  without answering it; the close code is not specified.
+- **Envelope ceiling:** from the moment the upgrade completes, before
+  any `THello`, a receiver MUST bound every WebSocket frame and every
+  reassembled message at 1 MiB before buffering it, and MUST close the
+  session when either bound is exceeded (rule 3). It SHOULD close with
+  close code 1009 (Message Too Big). Bounding only the reassembled
+  message is not enough, because one oversized frame is buffered
+  before reassembly starts.
 - **Liveness:** liveness is in-band (`TPing`/`RPing`, see
   "Heartbeats"). WebSocket Ping/Pong control frames carry no protocol
-  meaning. Either end answers them as RFC 6455 requires, but neither
-  presence nor revocation depends on them, and a client MUST NOT use
-  them in place of `TPing`.
+  meaning. Either end answers them as RFC 6455 requires, but they do
+  not reset the hub's idle timer, neither presence nor revocation
+  depends on them, and a client MUST NOT use them in place of
+  `TPing`.
 - **Subprotocol:** `quickring.v1`, the binding identifier for this
   major version. It identifies the binding. It does not negotiate
   the protocol version (rule 5).
   - A client MUST offer `quickring.v1` in `Sec-WebSocket-Protocol`
-    on the upgrade request.
-  - A hub that serves `/v1` MUST echo `quickring.v1` in the upgrade
-    response when the client offered it. A hub MUST NOT echo a
-    subprotocol the client did not offer.
-  - A v1 hub MUST accept an upgrade that offers **no** subprotocol,
-    and completes it without a `Sec-WebSocket-Protocol` header.
-    Clients that predate this rule offer none. Absence stays
-    tolerated on `/v1` for the life of the v1 binding, including
-    the N/N+1 window of the next major version (see "Versioning").
+    on the upgrade request, except as the platform carve-out below
+    allows.
+  - Matching is exact and case-sensitive. When the offer includes
+    `quickring.v1`, alone or among other values, a hub that serves
+    `/v1` MUST echo `quickring.v1` and nothing else.
+  - When the offer does not include `quickring.v1` (there is no
+    offer, or it names only values the hub does not know), the hub
+    MUST complete the upgrade with no `Sec-WebSocket-Protocol`
+    header, exactly as for no offer. It MUST NOT refuse the upgrade.
+  - A hub MUST NOT echo a value the client did not offer.
+  - Absence of a subprotocol is tolerated on `/v1` for the life of
+    the v1 binding, because some clients offer no subprotocol. The
+    client's MUST-offer is therefore not enforceable by the hub.
   - A client that offered `quickring.v1` and receives an upgrade
-    response with no subprotocol MAY continue, because the hub
-    may predate this rule. A client MUST fail the connection if the
-    response names a subprotocol it did not offer (RFC 6455 §4.1).
+    response with no `Sec-WebSocket-Protocol` header MUST continue as
+    if the hub had echoed it, because the hub may not implement
+    subprotocol selection. It MUST NOT fail the connection and MUST
+    NOT retry without the offer.
+  - A client MUST fail the connection if the response names a
+    subprotocol it did not offer (RFC 6455 §4.1). Where the client's
+    WebSocket library does not perform this check, the client does.
+  - **Platform carve-out:** a client on a platform whose WebSocket
+    API fails the connection when the server selects none of the
+    offered subprotocols (web browsers do) MAY omit the offer.
   - Neither side branches protocol behaviour on the subprotocol.
     `TVersion` remains authoritative. A hub that echoes
     `quickring.v1` still answers an unsupported `TVersion` with
     `RError(VERSION_INCOMPATIBLE)`.
-
-  > **Implementation status (2026-11-11):** the subprotocol rules above
-  > are newly normative. Neither reference implementation follows them
-  > yet: the reference hub does not echo a subprotocol, and Fabric
-  > Kit does not offer one. Interoperability is unaffected in the
-  > meantime, because absence is tolerated in both directions and
-  > `TVersion` already does all version work.
 - **Same carrier, no spec change:** WebSocket over HTTP/2 (RFC 8441)
   or HTTP/3 (RFC 9220), and WSS tunnelled through an explicit HTTP
   `CONNECT` proxy, are this same binding. They are usable wherever
-  the edge and the client support them.
+  the edge and the client support them. A client MUST NOT relax TLS
+  certificate validation to traverse a proxy, and proxy credentials
+  are never hub credentials.
 
 ---
 
@@ -266,7 +362,7 @@ by the prefix of its type name:
 
 | Prefix | Direction | Semantics |
 |---|---|---|
-| **T** | Client → Server | A client request. Carries a tag. The server **must** respond with exactly one matching R-message or RError carrying the same tag. |
+| **T** | Client → Server | A client request. Carries a tag. For as long as its session lasts, it receives exactly one terminal response (its R-message or an RError) with the same tag; see "Tag discipline". |
 | **R** | Server → Client | A server response to a previously-received T-message. Carries the same tag as the request. |
 | **D** | Server → Client | A server-pushed message, unsolicited. Carries `tag = 0`. The client does not respond. |
 
@@ -376,9 +472,11 @@ to add new types in future versions without breaking older clients
   outstanding tag on it is abandoned unanswered, and a new session
   starts with no tags in flight.
 
-**One T, one R.** Every T-message receives exactly one terminal
-response — either its matching R-message or an `RError` — carrying
-the same tag, after which the tag is free for reuse. A T-message
+**One T, one R.** For as long as its session lasts, every T-message
+receives exactly one terminal response (its R-message or an
+`RError`) with the same tag, after which the tag is free for reuse.
+If the session ends first, the T-message receives no response. A
+T-message
 **never** produces two responses on the same tag. Where an
 interaction needs to signal something later (e.g. device-pairing
 approval, which waits on a human), that later signal is a
@@ -412,8 +510,9 @@ in order:
    (carrier up) ──> Version ──> Hello ──> Ready ──> (carrier closed)
 ```
 
-Where this document says the server "closes the connection", it means
-the server ends the session by closing its carrier session.
+Where the server is said to close the session, it ends the session by
+closing its carrier session. Where comments in the schema say
+"connection", they mean the session.
 
 ### 1. Version negotiation
 
@@ -440,7 +539,7 @@ message RVersion {
   string version = 1;
 
   // Server's max envelope size (the actual ceiling for this
-  // connection: min of client offer and server limit).
+  // session: min of client offer and server limit).
   uint32 max_envelope_size = 2;
 
   // Server-issued random nonce for device proof-of-possession at
@@ -460,7 +559,7 @@ message RVersion {
 
 If the server cannot agree on a version (the client offered a
 version the server does not implement), the server responds with
-`RError(code=VERSION_INCOMPATIBLE)` and closes the connection.
+`RError(code=VERSION_INCOMPATIBLE)` and closes the session.
 
 Version strings follow the form `quickring.v<major>`. Within a
 major version, the protocol is backward-compatible: a v1.3 server
@@ -517,7 +616,7 @@ message THello {
 
   // Optional resume token from a previous session on this device.
   // Presenting a valid resume_token lets the server re-establish
-  // the session's prior subscriptions without a fresh round of
+  // the previous session's subscriptions without a fresh round of
   // TSubscribe calls. It does NOT itself replay missed messages —
   // to recover messages sent while offline, the client issues
   // TCatchUp per subscription after RHello. If absent or invalid,
@@ -590,14 +689,21 @@ enum PresenceState {
 ```
 
 Auth failures (`RError(code=AUTH_INVALID)`, `RError(code=AUTH_EXPIRED)`)
-close the connection. The client should re-acquire an auth token via
-the HTTP API and reconnect.
+close the session. The client should re-acquire an auth token via
+the HTTP API and start a new session.
 
 ### 3. Ready
 
 After `RHello`, the session is ready for normal traffic. The
 client may now issue subscribes, publishes, catch-ups, and pairing
 requests. The server may now push `DDeliver` and `DPresence`.
+
+**Establishment deadline.** Within 10 seconds of a carrier session
+being established, the hub MUST either have sent `RHello` on it or
+have placed it in pairing wait (a new device that has received
+`RPairClaimed`; see "Device pairing"). Otherwise the hub MUST close
+it, regardless of any traffic on it. Pairing wait has its own
+timeout, the pair session's expiry.
 
 ### Heartbeats
 
@@ -615,21 +721,26 @@ message RPing {
 
 Clients send `TPing` every 30 seconds while idle. The server uses
 the heartbeat to refresh the device's presence TTL in Redis. A
-session with no traffic (including pings) for 90 seconds is
-considered abandoned, and the server closes it. Carrier-level
-keepalives (WebSocket Ping/Pong, TCP keepalive) never refresh
-presence. A client MUST NOT rely on them to keep a session open;
-`TPing` is the only keepalive this protocol defines.
+session that receives no envelope (pings included) for 90 seconds is
+considered abandoned, and the server closes it. Only an envelope
+resets this idle timer. Carrier frames (WebSocket Ping/Pong, TCP
+keepalive) MUST NOT reset it and MUST NOT refresh presence. A client
+MUST NOT rely on them to keep a session open; `TPing` is the only
+keepalive this protocol defines.
 
-Every `TPing` also re-validates the session's registration against
-current state (has this device's registration been replaced or
-removed? has the account owner revoked it?). If it no longer checks
-out, the server closes the session instead of answering with
-`RPing` — no `RError` either, since the tag simply never resolves and
-the client is expected to treat a closed session the same way it
-treats any other drop. This bounds a revoked-but-live session to at
-most one heartbeat interval (~30s) even with **no wire message at
-all**, which is why it exists independently of, not instead of,
+**Registration re-validation.** While a session is Ready, the hub
+MUST re-validate the session's registration against current state
+(has this device's registration been replaced or removed? has the
+account owner revoked it?) at least once every 30 seconds of session
+time, measured on the hub's own clock, whatever the client sends or
+does not send. A `TPing` also triggers the check before it is
+answered. If the registration no longer checks out, the hub closes
+the session, answering neither `RPing` nor `RError`: any outstanding
+tag simply never resolves, and the client is expected to treat a
+closed session the same way it treats any other drop. This bounds a
+revoked-but-live session to one 30-second re-validation interval
+even when **no revocation message reaches the device** and the
+client sends nothing, which is why it exists independently of, not instead of,
 `DSessionRevoked` below: the two together are an immediate path and a
 bounded fallback, not two implementations of the same thing.
 
@@ -674,7 +785,7 @@ message TSubscribe {
   // subscription is ALWAYS forward-only from the moment it is
   // registered. Recovering messages published before the subscription
   // is TCatchUp's job and TCatchUp's alone (QR-134 ruling, 2026-08-18):
-  // there is exactly one catch-up path, not two. See "Catch-up" below
+  // there is exactly one catch-up path, not two. See "Offline catch-up" below
   // for the canonical reconnect recipe.
   reserved 2;
   reserved "since_ms";
@@ -758,11 +869,11 @@ message TPublish {
   // Optional client-assigned message id for deduplication on
   // retry. If omitted, the server assigns one. Deduplication is
   // scoped to (account_id, client_message_id) and held in Redis
-  // with a 10-minute TTL — NOT scoped to the connection. This is
+  // with a 10-minute TTL — NOT scoped to the session. This is
   // deliberate: the case a client_message_id exists to handle is
-  // "connection dropped mid-publish, client doesn't know if it
-  // landed, reconnects on a new connection, retries." A
-  // connection-scoped dedup would miss exactly that case. If a
+  // "session dropped mid-publish, client doesn't know if it
+  // landed, starts a new session, retries." A
+  // session-scoped dedup would miss exactly that case. If a
   // TPublish arrives whose (account_id, client_message_id) the hub
   // has seen within the TTL window, the hub returns the original
   // RPublish (same message_id, same server_time_ms) instead of
@@ -894,7 +1005,7 @@ The server pushes `DSessionRevoked` to a device whose session has
 been administratively invalidated — its registration was replaced
 (a key rotation, e.g. device-0 recovery) or an account owner revoked
 it. Sent **immediately before** the server closes that device's
-connection, so a client that receives it can tell a deliberate
+session, so a client that receives it can tell a deliberate
 revocation apart from a transient network drop and respond
 accordingly (surface it to the user; do not silently reconnect with
 the same credentials).
@@ -922,10 +1033,12 @@ hub-plaintext relay as everything else in v1).
 
 A device is not guaranteed to receive this push — it may be offline
 at the moment of revocation, or the push itself may be dropped. The
-`TPing` re-validation described under "Heartbeats" above is the
-bound for that case: at most one heartbeat interval (~30s) rather
-than an unbounded window. `DSessionRevoked` is the immediate path;
-the `TPing` check is the fallback that does not depend on delivery.
+hub-clocked registration re-validation described under "Heartbeats"
+above is the bound for that case: at most one 30-second
+re-validation interval, whether or not the client sends anything,
+rather than an unbounded window. `DSessionRevoked` is the immediate
+path; the re-validation is the fallback that does not depend on
+delivery.
 
 See `dlockamy/vault: wiki/decisions/quickring-capability-model-fuchsia.md`
 §6.2 and `wiki/decisions/quickring-protocol-security-roadmap.md` §5 for
@@ -1018,7 +1131,8 @@ TPair(step=INITIATE) ──────────────►
                                                         and bootstrap
                                                         endpoint]
 
-                                                       (opens WebSocket)
+                                                       (establishes a
+                                                        carrier session)
                                                        TVersion / RVersion
                                                        (no THello — paired
                                                         identity is being
@@ -1059,8 +1173,8 @@ TPair(step=APPROVE,
                                                               account_credentials,
                                                               device_id)
                                                        [persists creds,
-                                                        opens a fresh
-                                                        connection, sends
+                                                        starts a fresh
+                                                        session, sends
                                                         THello]
 ```
 
@@ -1167,7 +1281,7 @@ message RPairInitiated {
   // existing device. Short-lived (60 seconds).
   string pair_session_id = 1;
 
-  // QR payload to display. Includes: pair_session_id, the WebSocket
+  // QR payload to display. Includes: pair_session_id, the hub's
   // bootstrap endpoint, and a short-lived single-use bootstrap
   // credential. Encoded as a URL: quickring://pair?...
   string qr_payload = 2;
@@ -1243,7 +1357,7 @@ message DPairResult {
 
   // Populated only when outcome == OUTCOME_APPROVED. These are the
   // credentials the new device persists and uses for its first
-  // THello on a fresh connection.
+  // THello in a fresh session.
   optional PairCredentials credentials = 3;
 }
 
@@ -1423,7 +1537,7 @@ v1").
 ```protobuf
 message TRoster {
   // Device ids to fetch. EMPTY MEANS THE WHOLE ROSTER for this
-  // connection's account.
+  // session's account.
   repeated string device_ids = 1;
 }
 
@@ -1712,7 +1826,7 @@ enum ErrorCode {
   AUTH_INVALID               = 2;
   AUTH_EXPIRED               = 3;
   HELLO_REQUIRED             = 4;  // T-message sent before THello
-  ALREADY_HELLOED            = 5;  // Second THello on the same connection
+  ALREADY_HELLOED            = 5;  // Second THello in the same session
 
   // Protocol
   TAG_IN_USE                 = 10;
@@ -1741,7 +1855,7 @@ enum ErrorCode {
   // Generic
   INTERNAL                   = 90;  // Hub-side bug; report to ops
   TEMPORARILY_UNAVAILABLE    = 91;  // Backoff and retry
-  ABUSE_DETECTED             = 92;  // Suspicious pattern; connection closing
+  ABUSE_DETECTED             = 92;  // Suspicious pattern; session closing
 
   reserved 51 to 59;                // held for the roster family
 }
@@ -1774,17 +1888,33 @@ Initial v1 limits (subject to public-beta tuning):
 | TSubscribe | 50 active | Per session |
 | TSubscribe | 200 active | Per account |
 | Payload size | 64 KiB | Per TPublish (larger payloads go out-of-band via WebRTC or Bitchain, v1.5+) |
-| Session rate | 5/minute | Per account from new IPs |
+| Carrier-session rate | 5/minute | Per account from new IPs |
 | Pair sessions | 3 concurrent | Per account |
 | TRoster | not yet set | Per session and per account |
 
 Every limit is scoped to a session or an account, never to a carrier
-artifact. The session-rate limit counts new **carrier sessions**
-(on the WSS binding, WebSocket upgrades that complete). It never
-counts individual HTTP requests on any carrier. The "new IP" it
-refers to is the address the carrier session was established from.
-No limit is keyed on the source address of an individual request
-within a session.
+artifact. The carrier-session-rate limit counts new **carrier
+sessions**: on the WSS binding, WebSocket upgrades that complete,
+including an RFC 8441 or RFC 9220 extended `CONNECT` that completes.
+It never counts individual HTTP requests on any carrier. The "new IP"
+it refers to is the source address the carrier session was
+established from, as seen by the hub's trusted edge. No limit is
+keyed on the source address of an individual request within a
+session.
+
+These per-account limits do not restrict admission control before
+authentication. A hub SHOULD also limit carrier-session establishment
+and unauthenticated sessions per source address. The source address
+is the one reported by a configured trusted proxy (for example, the
+client-address header a CDN sets, where the origin accepts traffic
+only from that CDN). A hub MUST NOT take a forwarded-address header
+from any peer that is not a configured trusted proxy.
+
+In the schema's `RateLimitDetails.scope` (carried in `RError.details`
+as `ErrorDetails.rate_limit`), `RATE_LIMIT_SCOPE_CONNECTION` (value 1)
+denotes the per-session limiter. The name predates the carrier-neutral
+definition of a session; its numeric value and wire encoding are
+unchanged.
 
 `ROSTER_RATE_LIMITED` exists as a code so the limit can be turned on
 without a wire change; the **numbers** are a public-beta abuse-policy
@@ -1810,10 +1940,11 @@ stance. See `agents/projects/quickring.md` for the locked rationale.
 - Within a major version, the protocol is backward-compatible.
   New message types are additive; new fields on existing messages
   must be optional.
-- A new carrier binding is additive. It gets new endpoint paths
-  under the same major version, carries the same envelope, and
-  negotiates with the same `TVersion`. It changes no envelope byte
-  and needs no major bump.
+- A carrier binding that this standard adds is additive. It gets new
+  endpoint paths under the same major version, satisfies every rule
+  of the carrier contract, carries the same envelope, and negotiates
+  with the same `TVersion`. It changes no envelope byte and needs no
+  major bump. Implementations do not add bindings (see "Carriers").
 - Breaking changes require a major version bump. The hub supports
   the previous major version for at least **90 days** after a new
   major version goes live, to give SDKs and third-party agents
@@ -1873,24 +2004,17 @@ do not appear in this version of the protocol.
   residual (see "Roster read"). Forcing a directory to *prove*
   freshness is the key-transparency problem and is not attempted
   here.
-- **An HTTP streaming carrier.** A second carrier for clients on
-  networks that refuse the WebSocket upgrade but pass streamed HTTPS:
-  one long-lived streaming `GET` downstream and upstream `POST`s, both
-  using stream framing (see "Carriers"). Long-poll is its polling
-  mode, not a separate design. It is named here so nobody invents it
-  differently, and it is **deliberately not built or specified in
-  v1**. It would need no envelope change and no change to hub
-  ordering, authentication or E2E, but it does need carrier-level
-  rules that v1 does not define: strict upstream ordering across
-  `POST`s, downstream acknowledgement in polling mode, and a carrier
-  session credential binding each `POST` to its session, which
-  requires a security review before any build. **Build trigger:** a
-  measured population of failed `/v1` upgrades in hub and Cloudflare
-  telemetry that persists *after* client support for HTTP `CONNECT`
-  proxies has shipped. Until then the WSS binding is the only
-  conforming carrier. Mapping Hearth semantics onto REST resources
-  (topics in URLs, delivery by webhook) is a different thing and is
-  rejected outright: it would be a second wire contract.
+- **Additional carriers.** v1 defines one carrier, the WSS binding,
+  and no other carrier conforms. Further carriers (for example, an
+  HTTP streaming carrier for networks that refuse the WebSocket
+  upgrade) are additive under "Carriers" and "Versioning": the same
+  envelope, and no change to message ordering, authentication or E2E.
+  Their carrier-level rules (upstream ordering across requests,
+  acknowledgement, and a carrier session credential binding each
+  request to its session under rule 7) are not defined in v1 and need
+  a security design before use. Mapping Quickring semantics onto REST
+  resources (topics in URLs, delivery by webhook) is not a carrier and
+  is rejected: it would be a second wire contract.
 - **Teams / multi-account topics** (`v2.5`). The `team/` topic
   prefix is reserved but unused.
 - **Federation** (`v3+`). v1 is hub-anchored. No `@user@otherhub`
@@ -1961,12 +2085,12 @@ Captured for resolution before v0 implementation begins.
    Should be load-tested before public beta to balance presence
    accuracy against hub CPU cost.
 4. **`DPairResult` delivery when the new device is briefly
-   disconnected.** The new device holds an open connection while
+   disconnected.** The new device holds its session open while
    waiting for approval, so in the common case `DPairResult` pushes
-   straight down it. But if that connection drops between
+   straight down it. But if that session ends between
    `RPairClaimed` and approval, the push has nowhere to go. Options:
-   the new device polls a `TPair(step=POLL)` on reconnect, or the
-   pairing bootstrap connection supports the normal resume
+   the new device polls a `TPair(step=POLL)` in a new session, or the
+   pairing bootstrap session supports the normal resume
    mechanism. Not resolved in the schema: `PairStep` has no `POLL` step,
    and the reference hub implements pairing without one.
 
@@ -1991,15 +2115,19 @@ Captured for resolution before v0 implementation begins.
 
 ---
 
-*Last updated: 2026-06-06 (v0 shipped — tag `v0`). Maintained by the
+*Last updated: 2026-11-11 (v0 shipped 2026-06-06, tag `v0`). Maintained by the
 Messaging Architect agent. Developer review pass complete; the canonical
 `.proto` is published at `../proto/quickring/v1/quickring.proto` and the v0
 subset is implemented end to end (hub QR-3..6, Fabric Kit QR-7, agent
 QR-8/9 — epic QR-1 closed). Ownership reframed per ADR-0002: this standard
 owns both layers; message-kit and Fabric Kit are conforming implementations.
-2026-11-11: made carrier-neutral (no wire change). A session is now defined
-per carrier session, not per WebSocket connection. Added the "Carriers"
-section (carrier contract, stream framing, WSS binding). The `quickring.v1`
-subprotocol is now normative (client offers, hub echoes, absence tolerated,
-`TVersion` authoritative). The HTTP streaming carrier is named under "What's
-deliberately not in v1".*
+2026-11-11: made carrier-neutral, with no envelope change and no field
+change. A session is now defined per carrier session, not per WebSocket
+connection, and tag tracking, heartbeats and rate limits are scoped to the
+session. Added the "Carriers" section (carrier contract, stream framing,
+WSS binding). On the WSS binding the `quickring.v1` subprotocol offer and
+echo are now normative: a change to the upgrade handshake, not to the
+envelope. Carrier keepalives no longer count toward liveness, and the hub
+re-validates a session's registration on its own clock. "Connection rate"
+is renamed "Carrier-session rate". `TVersion` remains the only version
+authority.*
